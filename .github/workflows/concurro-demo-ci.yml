@@ -1,0 +1,42 @@
+name: Concurro Demo CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stacks-common:
+    name: Demo Rust
+    if: github.repository == 'concurro-demo-upstream/stacks-core'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    cache-mode: read
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt
+      - name: Install nextest
+        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: nextest@0.9.145
+      - name: Check stacks-common formatting
+        run: cargo fmt -p stacks-common -- --check
+      - name: Build and test stacks-common
+        run: cargo nextest run --locked -p stacks-common --lib --test-threads 4
