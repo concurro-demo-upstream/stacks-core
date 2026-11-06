@@ -39,4 +39,4 @@ jobs:
       - name: Check stacks-common formatting
         run: cargo fmt -p stacks-common -- --check
       - name: Build and test stacks-common
-        run: cargo nextest run --locked -p stacks-common --lib --test-threads 4
+        run: cargo nextest run --locked -p stacks-common --features rusqlite --lib --test-threads 4
