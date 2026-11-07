@@ -38,16 +38,12 @@ jobs:
           tool: nextest@0.9.145
       - name: Check shared crates and MARF integration formatting
         run: cargo fmt -p stacks-common -p stacks-marf -p stackslib -- --check
-      - name: Test shared utilities and MARF
+      - name: Test shared utilities, MARF and Clarity storage integration
         run: >-
           cargo nextest run --locked
-          -p stacks-common -p stacks-marf --features stacks-common/rusqlite
+          -p stacks-common -p stacks-marf -p stackslib
+          --features stacks-common/rusqlite
           --lib --test-threads 4
-      - name: Test historical Clarity state across forks
-        run: >-
-          cargo nextest run --locked -p stackslib --lib --test-threads 4
-          -E 'test(~clarity_vm::tests::forking::)'
-      - name: Test ephemeral MARF storage isolation
-        run: >-
-          cargo nextest run --locked -p stackslib --lib --test-threads 4
-          -E 'test(=clarity_vm::tests::ephemeral::test_ephemeral_marf_store)'
+          -E 'package(=stacks-common) | package(=stacks-marf)'
+          -E 'package(=stackslib) & test(~clarity_vm::tests::forking::)'
+          -E 'package(=stackslib) & test(=clarity_vm::tests::ephemeral::test_ephemeral_marf_store)'
