@@ -18,7 +18,7 @@ jobs:
     name: Demo Rust
     if: github.repository == 'concurro-demo-upstream/stacks-core'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     cache-mode: read
     env:
       CARGO_BUILD_JOBS: '4'
@@ -36,7 +36,18 @@ jobs:
         uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
         with:
           tool: nextest@0.9.145
-      - name: Check stacks-common formatting
-        run: cargo fmt -p stacks-common -- --check
-      - name: Build and test stacks-common
-        run: cargo nextest run --locked -p stacks-common --features rusqlite --lib --test-threads 4
+      - name: Check shared crates and MARF integration formatting
+        run: cargo fmt -p stacks-common -p stacks-marf -p stackslib -- --check
+      - name: Test shared utilities and MARF
+        run: >-
+          cargo nextest run --locked
+          -p stacks-common -p stacks-marf --features stacks-common/rusqlite
+          --lib --test-threads 4
+      - name: Test historical Clarity state across forks
+        run: >-
+          cargo nextest run --locked -p stackslib --lib --test-threads 4
+          -E 'test(~clarity_vm::tests::forking::)'
+      - name: Test ephemeral MARF storage isolation
+        run: >-
+          cargo nextest run --locked -p stackslib --lib --test-threads 4
+          -E 'test(=clarity_vm::tests::ephemeral::test_ephemeral_marf_store)'
