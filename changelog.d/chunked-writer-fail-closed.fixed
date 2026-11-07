@@ -1,0 +1,1 @@
+The chunked HTTP writer no longer emits malformed output after a write failure or repeated completion.
