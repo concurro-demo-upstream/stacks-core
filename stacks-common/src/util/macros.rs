@@ -532,10 +532,7 @@ macro_rules! impl_array_hexstring_fmt {
         impl ::std::fmt::Debug for $thing {
             fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
                 let &$thing(data) = self;
-                for ch in data.iter() {
-                    write!(f, "{:02x}", ch)?;
-                }
-                Ok(())
+                f.write_str(&$crate::util::hash::to_hex(&data))
             }
         }
     };
@@ -552,19 +549,7 @@ macro_rules! impl_byte_array_newtype {
             /// Instantiates from a hex string
             #[allow(dead_code)]
             pub fn from_hex(hex_str: &str) -> Result<$thing, $crate::util::HexError> {
-                use $crate::util::hash::hex_bytes;
-                let _hex_len = $len * 2;
-                match (hex_str.len(), hex_bytes(hex_str)) {
-                    (_hex_len, Ok(bytes)) => {
-                        if bytes.len() != $len {
-                            return Err($crate::util::HexError::BadLength(hex_str.len()));
-                        }
-                        let mut ret = [0; $len];
-                        ret.copy_from_slice(&bytes);
-                        Ok($thing(ret))
-                    }
-                    (_, Err(e)) => Err(e),
-                }
+                $crate::util::hex_bytes_array::<$len>(hex_str).map($thing)
             }
 
             /// Instantiates from a slice of bytes

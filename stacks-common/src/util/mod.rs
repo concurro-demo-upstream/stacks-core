@@ -99,7 +99,7 @@ pub fn sleep_ms(millis: u64) {
 /// Hex deserialization error
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum HexError {
-    /// Length was not 64 characters
+    /// Invalid hex string length, measured in input bytes
     BadLength(usize),
     /// Non-hex character in string
     BadCharacter(char),
@@ -137,10 +137,11 @@ pub trait HexSer {
 
 impl<const N: usize> HexSer for [u8; N] {
     fn fmt_hex(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}", hash::to_hex(self))
+        f.write_str(&hash::to_hex(self))
     }
 }
 
+/// Checks length before decoding to reject oversized input before allocating.
 impl<const N: usize> HexDeser for [u8; N] {
     fn try_from_hex(hex: &str) -> Result<Self, HexError> {
         if hex.len() != N * 2 {
@@ -153,6 +154,16 @@ impl<const N: usize> HexDeser for [u8; N] {
                                      hex.len(),
                                  ))
     }
+}
+
+/// Decode hex into a fixed-size array, checking decoded length after decoding.
+///
+/// Unlike `[u8; N]::try_from_hex`, decoding errors take precedence over a
+/// decoded-size mismatch. A size mismatch reports the input length in bytes.
+pub fn hex_bytes_array<const N: usize>(hex: &str) -> Result<[u8; N], HexError> {
+    hex_bytes(hex)?
+        .try_into()
+        .map_err(|_| HexError::BadLength(hex.len()))
 }
 
 /// Write any `serde_json` object directly to a file
