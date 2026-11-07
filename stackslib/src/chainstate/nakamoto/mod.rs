@@ -1137,6 +1137,11 @@ impl NakamotoBlockHeader {
     /// Make an "empty" header whose block data needs to be filled in.
     /// This is used by the miner code. The block's timestamp is set here, at
     /// the time of creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ChainstateError::InvalidStacksBlock` if `bitvec_len` is not a valid PoX
+    /// treatment length (it is 0 or exceeds the `pox_treatment` capacity).
     pub fn from_parent_empty(
         chain_length: u64,
         burn_spent: u64,
@@ -1145,8 +1150,13 @@ impl NakamotoBlockHeader {
         bitvec_len: u16,
         parent_timestamp: u64,
         timestamp: u64,
-    ) -> NakamotoBlockHeader {
-        NakamotoBlockHeader {
+    ) -> Result<NakamotoBlockHeader, ChainstateError> {
+        let pox_treatment = BitVec::ones(bitvec_len).map_err(|e| {
+            ChainstateError::InvalidStacksBlock(format!(
+                "Invalid PoX treatment length {bitvec_len}: {e}"
+            ))
+        })?;
+        Ok(NakamotoBlockHeader {
             version: NAKAMOTO_BLOCK_VERSION,
             chain_length,
             burn_spent,
@@ -1157,10 +1167,9 @@ impl NakamotoBlockHeader {
             timestamp: std::cmp::max(parent_timestamp, timestamp),
             miner_signature: MessageSignature::empty(),
             signer_signature: vec![],
-            pox_treatment: BitVec::ones(bitvec_len)
-                .expect("BUG: bitvec of length-1 failed to construct"),
+            pox_treatment,
             problematic_txs: vec![],
-        }
+        })
     }
 
     /// Make a completely empty header

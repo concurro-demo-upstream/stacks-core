@@ -23,9 +23,16 @@ use crate::codec::{
 };
 use crate::util::hash::{bytes_to_hex, hex_bytes};
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 /// This data structure represents a list of booleans
 /// as a bitvector.
+///
+/// A `BitVec` is never empty: constructors and deserialization reject length 0.
+///
+/// If `len` is not a multiple of 8, the high bits of the last byte are padding.
+/// Padding is ignored by equality, `get` and `iter`. It is not normalized by
+/// `consensus_deserialize`, which keeps the bytes it received, so decoding and
+/// re-encoding a value reproduces its consensus bytes (and any hash over them).
 ///
 /// The generic argument `MAX_SIZE` specifies the maximum number of
 /// elements that the bit vector can hold. It is not the _actual_ size
@@ -67,12 +74,25 @@ impl<const MAX_SIZE: u16> TryFrom<&[bool]> for BitVec<MAX_SIZE> {
     }
 }
 
+/// Two `BitVec`s are equal if they have the same length and the same logical bits,
+/// regardless of the contents of the padding bits.
+impl<const MAX_SIZE: u16> PartialEq for BitVec<MAX_SIZE> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+
+impl<const MAX_SIZE: u16> Eq for BitVec<MAX_SIZE> {}
+
 impl<const MAX_SIZE: u16> StacksMessageCodec for BitVec<MAX_SIZE> {
     fn consensus_serialize<W: std::io::Write>(&self, fd: &mut W) -> Result<(), CodecError> {
         write_next(fd, &self.len)?;
         write_next(fd, &self.data)
     }
 
+    /// Reads only the bytes belonging to this value, so it can decode a `BitVec`
+    /// embedded in a larger stream. Standalone values (JSON, SQLite) must instead
+    /// consist of exactly one encoding, and are decoded by `deserialize_standalone`.
     fn consensus_deserialize<R: std::io::Read>(fd: &mut R) -> Result<Self, CodecError> {
         let len = read_next(fd)?;
         if len == 0 {
@@ -102,7 +122,7 @@ impl<'de, const MAX_SIZE: u16> Deserialize<'de> for BitVec<MAX_SIZE> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let hex: String = Deserialize::deserialize(deserializer)?;
         let bytes = hex_bytes(hex.as_str()).map_err(serde::de::Error::custom)?;
-        Self::consensus_deserialize(&mut bytes.as_slice()).map_err(serde::de::Error::custom)
+        Self::deserialize_standalone(&bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -110,8 +130,7 @@ impl<'de, const MAX_SIZE: u16> Deserialize<'de> for BitVec<MAX_SIZE> {
 impl<const MAX_SIZE: u16> FromSql for BitVec<MAX_SIZE> {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let bytes = hex_bytes(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e)))?;
-        Self::consensus_deserialize(&mut bytes.as_slice())
-            .map_err(|e| FromSqlError::Other(Box::new(e)))
+        Self::deserialize_standalone(&bytes).map_err(|e| FromSqlError::Other(Box::new(e)))
     }
 }
 
@@ -151,8 +170,31 @@ impl<const MAX_SIZE: u16> Iterator for BitVecIter<'_, MAX_SIZE> {
 }
 
 impl<const MAX_SIZE: u16> BitVec<MAX_SIZE> {
-    /// Construct a new BitVec with all entries set to `false` and total length `len`
+    /// Decode a `BitVec` that is the whole of `bytes`, as for a JSON or SQLite value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CodecError::DeserializeError` if `bytes` is not a valid encoding or
+    /// has trailing bytes after it.
+    fn deserialize_standalone(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut cursor = bytes;
+        let bitvec = Self::consensus_deserialize(&mut cursor)?;
+        if !cursor.is_empty() {
+            return Err(CodecError::DeserializeError(format!(
+                "BitVec has {} trailing bytes",
+                cursor.len()
+            )));
+        }
+        Ok(bitvec)
+    }
+
+    /// Construct a new BitVec with all entries set to `false` and total length `len`.
+    ///
+    /// Returns `Err` if `len` is 0 or greater than `MAX_SIZE`.
     pub fn zeros(len: u16) -> Result<BitVec<MAX_SIZE>, String> {
+        if len == 0 {
+            return Err("BitVec length must be positive".into());
+        }
         if len > MAX_SIZE {
             return Err(format!(
                 "BitVec length is too long. Max size = {MAX_SIZE}, Input len = {len}"
@@ -162,7 +204,9 @@ impl<const MAX_SIZE: u16> BitVec<MAX_SIZE> {
         Ok(BitVec { data, len })
     }
 
-    /// Construct a new BitVec with all entries set to `true` and total length `len`
+    /// Construct a new BitVec with all entries set to `true` and total length `len`.
+    ///
+    /// Returns `Err` if `len` is 0 or greater than `MAX_SIZE`.
     pub fn ones(len: u16) -> Result<BitVec<MAX_SIZE>, String> {
         let mut bitvec: BitVec<MAX_SIZE> = BitVec::zeros(len)?;
         for i in 0..len {
@@ -184,6 +228,7 @@ impl<const MAX_SIZE: u16> BitVec<MAX_SIZE> {
         self.len
     }
 
+    /// Always `false`, since a `BitVec` is never empty. Provided alongside `len`.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -412,6 +457,73 @@ mod test {
             BitVec::<2>::zeros(3).is_err(),
             "Should fail to construct a length 3 zero vec when bound to bitlength 2"
         );
+    }
+
+    #[test]
+    fn constructors_reject_empty() {
+        assert!(BitVec::<10>::zeros(0).is_err());
+        assert!(BitVec::<10>::ones(0).is_err());
+        assert!(BitVec::<10>::zeros(1).is_ok());
+        assert!(BitVec::<10>::ones(1).is_ok());
+        assert!(BitVec::<10>::ones(11).is_err());
+    }
+
+    fn decode(hex: &str) -> BitVec<10> {
+        let bytes = hex_bytes(hex).unwrap();
+        BitVec::consensus_deserialize(&mut bytes.as_slice()).unwrap()
+    }
+
+    /// Bits at or above `len` in the last byte are padding: they do not affect
+    /// equality, but are preserved by a decode/encode round trip.
+    #[test]
+    fn equality_ignores_padding() {
+        let mut local = BitVec::<10>::zeros(10).unwrap();
+        for i in [0, 3, 5] {
+            local.set(i, true).unwrap();
+        }
+        let clean = decode("000a000000022900");
+        let padded = decode("000a0000000229fc");
+        assert_eq!(clean, local);
+        assert_eq!(padded, local);
+        assert_eq!(padded, clean);
+        assert_eq!(
+            bytes_to_hex(padded.serialize_to_vec().as_slice()),
+            "000a0000000229fc"
+        );
+
+        // a different logical bit or length is still unequal
+        let mut other = local.clone();
+        other.set(9, true).unwrap();
+        assert_ne!(other, local);
+        let ones_8 = BitVec::<16>::ones(8).unwrap();
+        let mut len_9 = BitVec::<16>::zeros(9).unwrap();
+        for i in 0..8 {
+            len_9.set(i, true).unwrap();
+        }
+        assert_ne!(ones_8, len_9);
+    }
+
+    #[test]
+    fn standalone_decoding_rejects_trailing_bytes() {
+        let exact: BitVec<10> = serde_json::from_str("\"000a000000022900\"").unwrap();
+        assert_eq!(exact, decode("000a000000022900"));
+        assert!(serde_json::from_str::<BitVec<10>>("\"000a00000002290000\"").is_err());
+
+        // the stream decoder stops at its own boundary
+        let bytes = hex_bytes("000a00000002290012").unwrap();
+        let mut cursor = bytes.as_slice();
+        BitVec::<10>::consensus_deserialize(&mut cursor).unwrap();
+        assert_eq!(cursor, &[0x12]);
+    }
+
+    #[cfg(feature = "rusqlite")]
+    #[test]
+    fn from_sql_rejects_trailing_bytes() {
+        use rusqlite::types::{FromSql, ValueRef};
+
+        let exact = BitVec::<10>::column_result(ValueRef::Text(b"000a000000022900")).unwrap();
+        assert_eq!(exact, decode("000a000000022900"));
+        assert!(BitVec::<10>::column_result(ValueRef::Text(b"000a00000002290000")).is_err());
     }
 
     #[test]
