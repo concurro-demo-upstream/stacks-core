@@ -1,0 +1,65 @@
+name: Demo Rust build
+description: Build the same demo test selection for trusted cache warming and PR validation.
+inputs:
+  warm-cache:
+    description: Build without running tests and save the main-branch cache.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Install the repository toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      with:
+        components: rustfmt
+        cache: 'false'
+        rustflags: ''
+    - name: Restore trusted build cache
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: demo-rust-v1-ubuntu24-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/actions/concurro-demo-rust/action.yml', '.github/workflows/concurro-demo-ci.yml') }}-${{ github.sha }}
+        restore-keys: |
+          demo-rust-v1-ubuntu24-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/actions/concurro-demo-rust/action.yml', '.github/workflows/concurro-demo-ci.yml') }}-
+    - name: Install nextest
+      uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+      with:
+        tool: nextest@0.9.145
+    - name: Check shared crates and MARF integration formatting
+      if: inputs.warm-cache != 'true'
+      shell: bash
+      run: cargo fmt -p stacks-common -p stacks-marf -p stackslib -- --check
+    - name: Build or test the demo selection
+      shell: bash
+      env:
+        WARM_CACHE: ${{ inputs.warm-cache }}
+      run: |
+        args=()
+        if [[ "$WARM_CACHE" == 'true' ]]; then
+          args+=(--no-run)
+        fi
+        cargo nextest run --locked \
+          -p stacks-common -p stacks-marf -p stackslib \
+          --features stacks-common/rusqlite \
+          --lib --test-threads 4 "${args[@]}" \
+          -E 'package(=stacks-common) | package(=stacks-marf)' \
+          -E 'package(=stackslib) & test(~clarity_vm::tests::forking::)' \
+          -E 'package(=stackslib) & test(=clarity_vm::tests::ephemeral::test_ephemeral_marf_store)'
+    - name: Save trusted main-branch cache
+      if: >-
+        inputs.warm-cache == 'true' && steps.cache.outputs.cache-hit != 'true' &&
+        github.repository == 'concurro-demo-upstream/stacks-core' &&
+        github.ref == 'refs/heads/main' &&
+        (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ steps.cache.outputs.cache-primary-key }}

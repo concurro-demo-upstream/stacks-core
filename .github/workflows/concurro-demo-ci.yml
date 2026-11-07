@@ -5,9 +5,17 @@ on:
     branches: [main]
     types: [opened, reopened, synchronize]
   workflow_dispatch:
+  schedule:
+    - cron: '23 2 * * *'
 
 permissions:
   contents: read
+
+env:
+  CARGO_BUILD_JOBS: '4'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
 
 concurrency:
   group: demo-ci-${{ github.event.pull_request.number || github.ref }}
@@ -16,34 +24,29 @@ concurrency:
 jobs:
   stacks-common:
     name: Demo Rust
-    if: github.repository == 'concurro-demo-upstream/stacks-core'
+    if: github.repository == 'concurro-demo-upstream/stacks-core' && github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     cache-mode: read
-    env:
-      CARGO_BUILD_JOBS: '4'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install the repository toolchain
-        run: |
-          rustup show active-toolchain
-          rustup component add rustfmt
-      - name: Install nextest
-        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+      - uses: ./.github/actions/concurro-demo-rust
+
+  warm-cache:
+    name: Warm demo Rust cache
+    if: >-
+      github.repository == 'concurro-demo-upstream/stacks-core' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    cache-mode: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tool: nextest@0.9.145
-      - name: Check shared crates and MARF integration formatting
-        run: cargo fmt -p stacks-common -p stacks-marf -p stackslib -- --check
-      - name: Test shared utilities, MARF and Clarity storage integration
-        run: >-
-          cargo nextest run --locked
-          -p stacks-common -p stacks-marf -p stackslib
-          --features stacks-common/rusqlite
-          --lib --test-threads 4
-          -E 'package(=stacks-common) | package(=stacks-marf)'
-          -E 'package(=stackslib) & test(~clarity_vm::tests::forking::)'
-          -E 'package(=stackslib) & test(=clarity_vm::tests::ephemeral::test_ephemeral_marf_store)'
+          persist-credentials: false
+      - uses: ./.github/actions/concurro-demo-rust
+        with:
+          warm-cache: 'true'
