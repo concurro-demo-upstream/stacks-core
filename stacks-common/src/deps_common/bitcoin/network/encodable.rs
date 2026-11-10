@@ -534,6 +534,89 @@ mod tests {
         );
     }
 
+    /// Encoding widths change at each CompactSize boundary; bytes and lengths must agree.
+    #[test]
+    fn varint_boundaries() {
+        let cases: &[(u64, &[u8], u64)] = &[
+            (0, &[0], 1),
+            (0xFC, &[0xFC], 1),
+            (0xFD, &[0xFD, 0xFD, 0], 3),
+            (0xFE, &[0xFD, 0xFE, 0], 3),
+            (0xFF, &[0xFD, 0xFF, 0], 3),
+            (0x100, &[0xFD, 0, 1], 3),
+            (0xFFFF, &[0xFD, 0xFF, 0xFF], 3),
+            (0x10000, &[0xFE, 0, 0, 1, 0], 5),
+            (0xFFFFFFFF, &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF], 5),
+            (0x100000000, &[0xFF, 0, 0, 0, 0, 1, 0, 0, 0], 9),
+            (u64::MAX, &[0xFF; 9], 9),
+        ];
+        for &(value, expected_bytes, expected_length) in cases {
+            let encoded = serialize(&VarInt(value)).unwrap();
+            assert_eq!(encoded, expected_bytes, "value {value:#x}");
+            assert_eq!(
+                deserialize::<VarInt>(expected_bytes).unwrap(),
+                VarInt(value)
+            );
+            assert_eq!(VarInt(value).encoded_length(), encoded.len() as u64);
+            assert_eq!(VarInt(value).encoded_length(), expected_length);
+        }
+    }
+
+    /// Wide forms accept their minimum value and reject the preceding value as non-minimal.
+    #[test]
+    fn deserialize_varint_minimality() {
+        let cases: &[(u64, &[u8], &[u8])] = &[
+            (0xFD, &[0xFD, 0xFD, 0], &[0xFD, 0xFC, 0]),
+            (0x10000, &[0xFE, 0, 0, 1, 0], &[0xFE, 0xFF, 0xFF, 0, 0]),
+            (
+                0x100000000,
+                &[0xFF, 0, 0, 0, 0, 1, 0, 0, 0],
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
+            ),
+        ];
+        for &(value, minimal, nonminimal) in cases {
+            assert_eq!(deserialize::<VarInt>(minimal).unwrap(), VarInt(value));
+            assert!(matches!(
+                deserialize::<VarInt>(nonminimal),
+                Err(Error::ParseFailed("non-minimal varint"))
+            ));
+        }
+    }
+
+    /// Every incomplete wide form, including a missing prefix, must report a short read.
+    #[test]
+    fn deserialize_varint_truncated() {
+        let mut inputs = vec![vec![]];
+        for (prefix, width) in [(0xFD, 2), (0xFE, 4), (0xFF, 8)] {
+            for payload_length in 0..width {
+                let mut input = vec![prefix];
+                input.extend(vec![0; payload_length]);
+                inputs.push(input);
+            }
+        }
+        for input in inputs {
+            match deserialize::<VarInt>(&input) {
+                Err(Error::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                }
+                result => panic!("expected UnexpectedEof for {input:?}, got {result:?}"),
+            }
+        }
+    }
+
+    /// Length prefixes require their promised payload, and a complete VarInt consumes all input.
+    #[test]
+    fn deserialize_varint_payload_and_trailing_bytes() {
+        assert!(deserialize::<Vec<u8>>(&[0xFD, 0xFD, 0, 42]).is_err());
+        assert!(deserialize::<String>(&[3, b'a', b'b']).is_err());
+        assert!(matches!(
+            deserialize::<VarInt>(&[0xFD, 0xFD, 0, 42]),
+            Err(Error::ParseFailed(
+                "data not consumed entirely when explicitly deserializing"
+            ))
+        ));
+    }
+
     #[test]
     fn deserialize_nonminimal_vec() {
         match deserialize::<Vec<u8>>(&[0xfd, 0x00, 0x00]) {

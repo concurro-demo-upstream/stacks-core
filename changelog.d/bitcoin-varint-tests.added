@@ -1,0 +1,1 @@
+Added Bitcoin VarInt tests for encoding boundaries, minimal encodings, truncated input, and incomplete payloads.
