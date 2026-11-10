@@ -21,6 +21,7 @@ use std::{assert_matches, fs};
 use tempfile::tempdir;
 
 use super::*;
+use crate::cache::BlockHashCache;
 use crate::*;
 
 fn ptrs_cmp(p1: &[TriePtr], p2: &[TriePtr]) -> bool {
@@ -627,4 +628,272 @@ fn test_dump_compressed_consume_cow_and_amendment_patches() {
             }
         }
     }
+}
+
+fn bhc_hash(n: u32) -> BlockHeaderHash {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&n.to_be_bytes());
+    BlockHeaderHash(bytes)
+}
+
+/// Look up `id` in `cache`, using a `lookup` that derives the hash from the ID and counts calls
+fn bhc_get(
+    cache: &mut BlockHashCache<BlockHeaderHash>,
+    id: u32,
+    calls: &mut u32,
+) -> BlockHeaderHash {
+    cache
+        .get_block_hash_caching(id, |id| -> Result<_, Error> {
+            *calls += 1;
+            Ok(bhc_hash(id))
+        })
+        .unwrap()
+        .clone()
+}
+
+#[test]
+/// The cache never holds more pairs than its capacity, and its two maps stay in step.
+fn block_hash_cache_is_bounded() {
+    let mut cache = BlockHashCache::with_capacity(4);
+    let mut calls = 0;
+    for id in 0..100 {
+        assert_eq!(bhc_get(&mut cache, id, &mut calls), bhc_hash(id));
+        assert!(cache.len() <= 4);
+        cache.assert_consistent();
+    }
+    assert_eq!(cache.len(), 4);
+    assert_eq!(calls, 100);
+}
+
+#[test]
+/// A working set that fits in the cache is never evicted: after the first pass over 8 IDs, every
+/// later pass hits, so `lookup` runs exactly once per ID.
+fn block_hash_cache_retains_fitting_working_set() {
+    let mut cache = BlockHashCache::with_capacity(8);
+    let mut calls = 0;
+    for _pass in 0..10 {
+        for id in 0..8 {
+            assert_eq!(bhc_get(&mut cache, id, &mut calls), bhc_hash(id));
+        }
+    }
+    assert_eq!(calls, 8);
+    assert_eq!(cache.misses(), 8);
+    cache.assert_consistent();
+}
+
+#[test]
+/// An evicted entry is looked up again and yields the same hash, and the reverse mapping from that
+/// hash yields the same ID.
+fn block_hash_cache_relookup_after_eviction() {
+    let mut cache = BlockHashCache::with_capacity(2);
+    let mut calls = 0;
+    assert_eq!(bhc_get(&mut cache, 1, &mut calls), bhc_hash(1));
+    assert_eq!(bhc_get(&mut cache, 2, &mut calls), bhc_hash(2));
+    assert_eq!(bhc_get(&mut cache, 3, &mut calls), bhc_hash(3));
+    assert_eq!(calls, 3);
+    // 1 was evicted: both directions miss
+    assert!(cache.ref_block_hash(1).is_none());
+    assert_eq!(cache.load_block_id(&bhc_hash(1)), None);
+
+    assert_eq!(bhc_get(&mut cache, 1, &mut calls), bhc_hash(1));
+    assert_eq!(calls, 4);
+    assert_eq!(cache.load_block_id(&bhc_hash(1)), Some(1));
+    cache.assert_consistent();
+}
+
+#[test]
+/// An entry that was used since the last sweep is skipped by the sweep, and an unused one is
+/// evicted instead.
+fn block_hash_cache_second_chance() {
+    let mut cache = BlockHashCache::with_capacity(3);
+    let mut calls = 0;
+    for id in 1..=3 {
+        bhc_get(&mut cache, id, &mut calls);
+    }
+    // use 1 again, then force an eviction: the sweep clears 1's bit and evicts 2
+    bhc_get(&mut cache, 1, &mut calls);
+    bhc_get(&mut cache, 4, &mut calls);
+    assert!(cache.ref_block_hash(1).is_some());
+    assert!(cache.ref_block_hash(2).is_none());
+    assert!(cache.ref_block_hash(3).is_some());
+    assert!(cache.ref_block_hash(4).is_some());
+
+    // `load_block_id` hits count as uses too
+    let mut cache = BlockHashCache::with_capacity(3);
+    for id in 1..=3 {
+        bhc_get(&mut cache, id, &mut calls);
+    }
+    assert_eq!(cache.load_block_id(&bhc_hash(1)), Some(1));
+    bhc_get(&mut cache, 4, &mut calls);
+    assert!(cache.ref_block_hash(1).is_some());
+    assert!(cache.ref_block_hash(2).is_none());
+}
+
+#[test]
+/// `ref_block_hash` does not count as a use, so it does not change which entry is evicted next.
+fn block_hash_cache_ref_block_hash_does_not_promote() {
+    let mut cache = BlockHashCache::with_capacity(3);
+    let mut calls = 0;
+    for id in 1..=3 {
+        bhc_get(&mut cache, id, &mut calls);
+    }
+    assert!(cache.ref_block_hash(1).is_some());
+    bhc_get(&mut cache, 4, &mut calls);
+    assert!(cache.ref_block_hash(1).is_none());
+    assert!(cache.ref_block_hash(2).is_some());
+}
+
+#[test]
+/// After a mix of lookups, hits, stores and evictions, a hash is reverse-mappable exactly when its
+/// ID is cached, and storing an evicted pair again does not trip `store_block_hash`'s assertion.
+fn block_hash_cache_maps_stay_in_lock_step() {
+    let mut cache = BlockHashCache::with_capacity(5);
+    let mut calls = 0;
+    let mut state = 12345u32;
+    for _ in 0..500 {
+        // small deterministic LCG
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        let id = (state >> 16) % 20;
+        if state & 0x100 == 0 {
+            assert_eq!(bhc_get(&mut cache, id, &mut calls), bhc_hash(id));
+        } else if cache.load_block_id(&bhc_hash(id)).is_none() {
+            // as `get_block_id_caching` does after a miss
+            cache.store_block_hash(id, bhc_hash(id));
+        }
+        cache.assert_consistent();
+    }
+    for id in 0..20 {
+        assert_eq!(
+            cache.load_block_id(&bhc_hash(id)).is_some(),
+            cache.ref_block_hash(id).is_some(),
+            "id {id}"
+        );
+    }
+    let evicted = (0..20)
+        .find(|id| cache.ref_block_hash(*id).is_none())
+        .unwrap();
+    cache.store_block_hash(evicted, bhc_hash(evicted));
+    assert_eq!(cache.load_block_id(&bhc_hash(evicted)), Some(evicted));
+    cache.assert_consistent();
+}
+
+#[test]
+/// Evicting an ID does not drop the reverse entry of a hash that is cached under another ID.
+fn block_hash_cache_eviction_keeps_reverse_entry_of_other_id() {
+    let mut cache = BlockHashCache::with_capacity(2);
+    // simulate stale data: the same hash cached under two IDs
+    cache.store_block_hash(1, bhc_hash(100));
+    cache.store_block_hash(2, bhc_hash(100));
+    assert_eq!(cache.load_block_id(&bhc_hash(100)), Some(2));
+
+    // inserting a third pair evicts the oldest unreferenced one, ID 1
+    let mut calls = 0;
+    bhc_get(&mut cache, 3, &mut calls);
+    assert!(cache.ref_block_hash(1).is_none());
+    assert_eq!(cache.load_block_id(&bhc_hash(100)), Some(2));
+    assert_eq!(cache.len(), 2);
+}
+
+#[test]
+/// A failed lookup caches nothing; a later successful one for the same ID is cached.
+fn block_hash_cache_does_not_cache_errors() {
+    let mut cache = BlockHashCache::<BlockHeaderHash>::with_capacity(4);
+    let res = cache.get_block_hash_caching(7, |_| Err(Error::NotFoundError));
+    assert!(matches!(res, Err(Error::NotFoundError)));
+    assert!(cache.is_empty());
+    assert!(cache.ref_block_hash(7).is_none());
+
+    let mut calls = 0;
+    assert_eq!(bhc_get(&mut cache, 7, &mut calls), bhc_hash(7));
+    assert_eq!(bhc_get(&mut cache, 7, &mut calls), bhc_hash(7));
+    assert_eq!(calls, 1);
+}
+
+/// Everything that a read-only client can observe about a forked history: values at several
+/// depths of each chain, block hashes by height and root hashes.  Reads alternate between the
+/// forks and repeat, so that bounded caches see evictions and re-lookups.
+fn observe_forked_history(
+    marf: &mut MARF<BlockHeaderHash>,
+    history: &ForkedHistory,
+) -> (
+    Vec<Option<MARFValue>>,
+    Vec<Option<BlockHeaderHash>>,
+    Vec<TrieHash>,
+) {
+    let mut values = vec![];
+    let mut heights = vec![];
+    let mut roots = vec![];
+    for _round in 0..3 {
+        let tips = history.tips();
+        let longest = tips.iter().map(|t| history.chain_len(*t)).max().unwrap();
+        for depth in (0..longest).step_by(3) {
+            for tip in tips.iter() {
+                if depth >= history.chain_len(*tip) {
+                    continue;
+                }
+                let block = history.ancestor(*tip, depth);
+                let k = depth % history.keys_per_block;
+                let value = MARF::get_by_key(
+                    &mut marf.borrow_storage_backend(),
+                    &history.blocks[*tip],
+                    &history.key(block, k),
+                )
+                .unwrap();
+                assert_eq!(value, Some(history.value(block, k)));
+                values.push(value);
+            }
+        }
+        for height in (0..longest).step_by(5) {
+            for tip in tips.iter() {
+                if height >= history.chain_len(*tip) {
+                    continue;
+                }
+                let bhh = MARF::get_block_at_height(
+                    &mut marf.borrow_storage_backend(),
+                    height as u32,
+                    &history.blocks[*tip],
+                )
+                .unwrap();
+                // the block at height h of the chain ending at `tip`
+                let expected_block = history.ancestor(*tip, history.chain_len(*tip) - 1 - height);
+                assert_eq!(bhh, Some(history.blocks[expected_block].clone()));
+                heights.push(bhh);
+            }
+        }
+        for tip in history.tips() {
+            roots.push(marf.get_root_hash_at(&history.blocks[tip]).unwrap());
+        }
+    }
+    (values, heights, roots)
+}
+
+#[test]
+/// A MARF with two forks gives the same values, block-by-height results and root hashes whether
+/// its block hash cache is the default size or so small that nearly every lookup misses.
+fn block_hash_cache_eviction_does_not_change_marf_reads() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("marf").to_str().unwrap().to_string();
+    let history = ForkedHistory::new(40, 20, 20, 4);
+    history.build(&path, MARFOpenOpts::default());
+
+    let storage = TrieFileStorage::open(&path, MARFOpenOpts::default()).unwrap();
+    let mut default_marf = MARF::from_storage(storage);
+    let expected = observe_forked_history(&mut default_marf, &history);
+    let default_misses = default_marf
+        .borrow_storage_backend()
+        .block_hash_cache_misses();
+
+    let mut storage = TrieFileStorage::open(&path, MARFOpenOpts::default()).unwrap();
+    storage.set_block_hash_cache_capacity(2);
+    let mut tiny_marf = MARF::from_storage(storage);
+    let observed = observe_forked_history(&mut tiny_marf, &history);
+    assert_eq!(observed, expected);
+
+    let conn = tiny_marf.borrow_storage_backend();
+    assert!(conn.block_hash_cache_len() <= 2);
+    conn.assert_block_hash_cache_consistent();
+    assert!(
+        conn.block_hash_cache_misses() > default_misses,
+        "capacity 2 should have evicted and re-looked-up entries"
+    );
 }

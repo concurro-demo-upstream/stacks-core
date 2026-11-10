@@ -1,0 +1,1 @@
+The MARF block hash and block ID cache now holds at most 65,536 entries per storage handle and evicts entries with the CLOCK policy, so its memory use no longer grows with the history a long-lived node has read; lookup results are unchanged, and re-reading an evicted entry costs one indexed database query.

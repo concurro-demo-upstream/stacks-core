@@ -16,14 +16,16 @@
 //! MARF performance tests intended to be run manually for analysis.
 
 use std::fs;
+use std::time::Instant;
 
 use stacks_common::types::chainstate::{BlockHeaderHash, TrieHash};
 use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::to_hex;
 
+use crate::cache::BLOCK_HASH_CACHE_CAPACITY;
 use crate::marf::{MARFOpenOpts, MarfConnection, MARF};
 use crate::storage::TrieFileStorage;
-use crate::test::{merkle_test_marf, opts};
+use crate::test::{merkle_test_marf, opts, ForkedHistory};
 use crate::{ClarityMarfTrieId, MARFValue, TrieLeaf};
 
 // insert a random sequence of 1024 * 1024 keys.  Every 4096 inserts, fork.
@@ -240,6 +242,214 @@ fn marf_read_random_1048576_4096_file_storage() {
                 );
 
                 start_time = get_epoch_time_ms();
+            }
+        }
+    }
+}
+
+/// Read a benchmark parameter from the environment
+fn bhc_param(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Small deterministic generator, so that every configuration replays the same reads
+struct BhcRng(u64);
+
+impl BhcRng {
+    fn next(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % bound as u64) as usize
+    }
+}
+
+/// Outcome of replaying the benchmark reads against one cache configuration
+struct BhcRun {
+    /// Time per `get`, in microseconds, on the first and the second replay
+    get_us: [f64; 2],
+    /// Time per `get_block_at_height`, in microseconds, on the first and the second replay
+    height_us: [f64; 2],
+    /// Block hash cache misses during the first and the second replay
+    misses: [u64; 2],
+    /// Pairs in the cache after both replays
+    cache_len: usize,
+}
+
+/// Replay `reads` (tip, block, key index) and `heights` (tip, height) twice against a fresh
+/// read-only handle on the MARF at `path`, whose block hash cache holds at most `capacity` pairs
+/// (the default capacity if `None`), and check every answer against `history`.
+fn bhc_run(
+    path: &str,
+    history: &ForkedHistory,
+    capacity: Option<usize>,
+    reads: &[(usize, usize, usize)],
+    heights: &[(usize, usize)],
+) -> BhcRun {
+    let mut storage = TrieFileStorage::open_readonly(path, MARFOpenOpts::default()).unwrap();
+    if let Some(capacity) = capacity {
+        storage.set_block_hash_cache_capacity(capacity);
+    }
+    let mut marf = MARF::from_storage(storage);
+    let mut run = BhcRun {
+        get_us: [0.0; 2],
+        height_us: [0.0; 2],
+        misses: [0; 2],
+        cache_len: 0,
+    };
+    let mut misses_before = 0;
+    for pass in 0..2 {
+        let start = Instant::now();
+        for (tip, block, k) in reads {
+            let value = MARF::get_by_key(
+                &mut marf.borrow_storage_backend(),
+                &history.blocks[*tip],
+                &history.key(*block, *k),
+            )
+            .unwrap();
+            assert_eq!(value, Some(history.value(*block, *k)));
+        }
+        if !reads.is_empty() {
+            run.get_us[pass] = start.elapsed().as_secs_f64() * 1e6 / reads.len() as f64;
+        }
+
+        let start = Instant::now();
+        for (tip, height) in heights {
+            let bhh = MARF::get_block_at_height(
+                &mut marf.borrow_storage_backend(),
+                *height as u32,
+                &history.blocks[*tip],
+            )
+            .unwrap();
+            let expected = history.ancestor(*tip, history.chain_len(*tip) - 1 - *height);
+            assert_eq!(bhh, Some(history.blocks[expected].clone()));
+        }
+        if !heights.is_empty() {
+            run.height_us[pass] = start.elapsed().as_secs_f64() * 1e6 / heights.len() as f64;
+        }
+
+        let conn = marf.borrow_storage_backend();
+        let misses = conn.block_hash_cache_misses();
+        run.misses[pass] = misses - misses_before;
+        misses_before = misses;
+    }
+    let conn = marf.borrow_storage_backend();
+    conn.assert_block_hash_cache_consistent();
+    run.cache_len = conn.block_hash_cache_len();
+    run
+}
+
+fn bhc_report(label: &str, capacity: Option<usize>, run: &BhcRun) {
+    info!(
+        "BHC {label}: capacity={capacity:?} get_us={:.1}/{:.1} height_us={:.1}/{:.1} misses={}/{} cache_len={}",
+        run.get_us[0],
+        run.get_us[1],
+        run.height_us[0],
+        run.height_us[1],
+        run.misses[0],
+        run.misses[1],
+        run.cache_len,
+    );
+}
+
+/// Measure what bounding `BlockHashCache` costs MARF reads.  Each configuration replays the same
+/// seeded reads twice on a fresh handle (first replay: cold cache; second replay: warm cache) and
+/// reports microseconds per read and cache misses.
+///
+/// Parameters (environment): `BHC_BLOCKS` main chain length (default 2048), `BHC_READS` number of
+/// gets (default 50000), `BHC_KEYS` keys per block (default 16), `BHC_LINEAR=1` for a single
+/// chain with no fork and no height lookups, `BHC_WINDOW` how many of the most recent blocks the
+/// linear run reads from (default 60000).
+///
+/// Default mode has a main chain plus a fork of half its length from its midpoint, reads that
+/// alternate between the two forks at seeded-random historical tips, and checks that when the
+/// working set fits the capacity the second replay has no misses.  Linear mode (use with `BHC_BLOCKS=70000`) measures the distinct
+/// IDs that the reads touch, checks that they fit the default capacity, and then checks that the
+/// second replay at the default capacity has no misses.
+#[test]
+#[ignore]
+fn marf_block_hash_cache_read_bench() {
+    let blocks = bhc_param("BHC_BLOCKS", 2048);
+    let num_reads = bhc_param("BHC_READS", 50_000);
+    let keys_per_block = bhc_param("BHC_KEYS", 16);
+    let linear = bhc_param("BHC_LINEAR", 0) == 1;
+    let window = bhc_param("BHC_WINDOW", 60_000).min(blocks);
+
+    let history = if linear {
+        ForkedHistory::new(blocks, 0, 0, keys_per_block)
+    } else {
+        ForkedHistory::new(blocks, blocks / 2, blocks / 2, keys_per_block)
+    };
+    let total = history.blocks.len();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marf").to_str().unwrap().to_string();
+    let start = Instant::now();
+    history.build(&path, MARFOpenOpts::default());
+    info!(
+        "BHC built {total} blocks x {keys_per_block} keys in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
+
+    let mut rng = BhcRng(0x9e3779b97f4a7c15);
+    // Alternate between the forks, reading from a seeded-random historical tip on each
+    let fork_len = total - blocks;
+    let random_tip = |rng: &mut BhcRng, i: usize| {
+        if i % 2 == 1 && fork_len > 0 {
+            blocks + rng.next(fork_len)
+        } else {
+            rng.next(blocks)
+        }
+    };
+    let mut reads = vec![];
+    for i in 0..num_reads {
+        let (tip, depth) = if linear {
+            // tips and keys in the most recent `window` blocks
+            let lo = blocks - window;
+            let tip = lo + rng.next(window);
+            (tip, rng.next(tip - lo + 1))
+        } else {
+            let tip = random_tip(&mut rng, i);
+            (tip, rng.next(history.chain_len(tip)))
+        };
+        reads.push((tip, history.ancestor(tip, depth), rng.next(keys_per_block)));
+    }
+    let mut heights = vec![];
+    if !linear {
+        for i in 0..2000 {
+            let tip = random_tip(&mut rng, i);
+            heights.push((tip, rng.next(history.chain_len(tip))));
+        }
+    }
+
+    if linear {
+        let unbounded = bhc_run(&path, &history, Some(total + 16), &reads, &heights);
+        bhc_report("unbounded", Some(total + 16), &unbounded);
+        let distinct = unbounded.cache_len;
+        info!("BHC distinct block IDs touched: {distinct}");
+        assert!(distinct <= BLOCK_HASH_CACHE_CAPACITY);
+
+        let default = bhc_run(&path, &history, None, &reads, &heights);
+        bhc_report("default", None, &default);
+        assert!(default.cache_len <= BLOCK_HASH_CACHE_CAPACITY);
+        assert_eq!(default.misses[1], 0);
+    } else {
+        let configs = [
+            ("unbounded", Some(total + 16)),
+            ("default", None),
+            ("total", Some(total)),
+            ("half", Some(total / 2)),
+            ("16", Some(16)),
+        ];
+        for (label, capacity) in configs {
+            let run = bhc_run(&path, &history, capacity, &reads, &heights);
+            bhc_report(label, capacity, &run);
+            if matches!(label, "unbounded" | "default" | "total") {
+                // the working set fits, so nothing was evicted
+                assert_eq!(run.misses[1], 0, "{label}");
             }
         }
     }

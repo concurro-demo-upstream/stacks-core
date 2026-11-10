@@ -1588,6 +1588,13 @@ impl<'a, T: MarfTrieId> ReopenedTrieStorageConnection<'a, T> {
 }
 
 impl<T: MarfTrieId> TrieFileStorage<T> {
+    /// Replace the block hash cache with a fresh, empty one that holds at most `capacity` pairs.
+    /// Lets tests and benchmarks force evictions.
+    #[cfg(test)]
+    pub fn set_block_hash_cache_capacity(&mut self, capacity: usize) {
+        self.cache = BlockHashCache::with_capacity(capacity);
+    }
+
     /// Detect whether this MARF was produced by a squash operation and, if
     /// so, cache the squash metadata [`SquashInfo`].
     ///
@@ -2326,6 +2333,25 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
 }
 
 impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
+    /// Number of block hash/block ID lookups that missed the block hash cache and found a row,
+    /// since it was last installed.  Used by tests and benchmarks.
+    #[cfg(test)]
+    pub fn block_hash_cache_misses(&self) -> u64 {
+        self.cache.misses()
+    }
+
+    /// Number of pairs in the block hash cache.  Used by tests and benchmarks.
+    #[cfg(test)]
+    pub fn block_hash_cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Panic if the block hash cache's internal maps are inconsistent.  Used by tests.
+    #[cfg(test)]
+    pub fn assert_block_hash_cache_consistent(&self) {
+        self.cache.assert_consistent()
+    }
+
     pub fn readonly(&self) -> bool {
         self.data.readonly
     }

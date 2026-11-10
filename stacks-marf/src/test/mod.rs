@@ -27,7 +27,7 @@ use crate::marf::*;
 use crate::node::*;
 use crate::storage::*;
 use crate::trie::*;
-use crate::{MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
+use crate::{ClarityMarfTrieId, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
 
 pub mod file;
 pub mod marf;
@@ -421,4 +421,118 @@ pub mod opts {
     #[case::def_comp(&opts::OPTS_DEF_COMP)]
     #[case::def_ext_comp(&opts::OPTS_DEF_EXT_COMP)]
     pub fn tpl_all_opts(#[case] marf_opts: &MARFOpenOpts) {}
+}
+
+/// A MARF history made of a main chain and, optionally, one fork that branches off the main chain,
+/// used to exercise block-identity lookups across forks.  Blocks are numbered: `0..main_len` are
+/// the main chain and `main_len..main_len + fork_len` are the fork, whose first block has
+/// `fork_point` as its parent.  Every block holds `keys_per_block` keys.
+pub struct ForkedHistory {
+    /// Block hashes, indexed by block number
+    pub blocks: Vec<BlockHeaderHash>,
+    /// Length of the main chain
+    pub main_len: usize,
+    /// Number of the main chain block that the first fork block builds on
+    pub fork_point: usize,
+    /// Number of keys written in each block
+    pub keys_per_block: usize,
+}
+
+impl ForkedHistory {
+    pub fn new(
+        main_len: usize,
+        fork_len: usize,
+        fork_point: usize,
+        keys_per_block: usize,
+    ) -> ForkedHistory {
+        assert!(main_len > 0 && fork_point < main_len);
+        let blocks = (0..main_len + fork_len)
+            .map(|i| {
+                let mut bytes = [0x5au8; 32];
+                bytes[0..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+                BlockHeaderHash(bytes)
+            })
+            .collect();
+        ForkedHistory {
+            blocks,
+            main_len,
+            fork_point,
+            keys_per_block,
+        }
+    }
+
+    /// Parent block number of a block, or `None` for the first block
+    pub fn parent(&self, block: usize) -> Option<usize> {
+        if block == 0 {
+            None
+        } else if block == self.main_len {
+            Some(self.fork_point)
+        } else {
+            Some(block - 1)
+        }
+    }
+
+    /// Chain tips: the end of the main chain, followed by the end of the fork if there is one.
+    pub fn tips(&self) -> Vec<usize> {
+        let mut tips = vec![self.main_len - 1];
+        if self.blocks.len() > self.main_len {
+            tips.push(self.blocks.len() - 1);
+        }
+        tips
+    }
+
+    /// Number of blocks on the chain that ends at `tip`, including `tip`
+    pub fn chain_len(&self, tip: usize) -> usize {
+        if tip < self.main_len {
+            tip + 1
+        } else {
+            self.fork_point + 1 + (tip - self.main_len + 1)
+        }
+    }
+
+    /// The block `depth` steps before `tip` on its chain (`depth` 0 is `tip` itself).  `depth`
+    /// must be less than `chain_len(tip)`.
+    pub fn ancestor(&self, tip: usize, depth: usize) -> usize {
+        assert!(depth < self.chain_len(tip));
+        let mut block = tip;
+        let mut remaining = depth;
+        if tip >= self.main_len {
+            let on_fork = tip - self.main_len + 1;
+            if remaining < on_fork {
+                return tip - remaining;
+            }
+            remaining -= on_fork;
+            block = self.fork_point;
+        }
+        block - remaining
+    }
+
+    pub fn key(&self, block: usize, k: usize) -> String {
+        format!("fh-{block}-{k}")
+    }
+
+    pub fn value(&self, block: usize, k: usize) -> MARFValue {
+        MARFValue::from_value(&format!("value-{block}-{k}"))
+    }
+
+    /// Write the whole history into a new file-backed MARF at `path`, which must not exist yet.
+    pub fn build(&self, path: &str, marf_opts: MARFOpenOpts) {
+        let storage = TrieFileStorage::open(path, marf_opts).unwrap();
+        let mut marf = MARF::from_storage(storage);
+        for block in 0..self.blocks.len() {
+            let parent = match self.parent(block) {
+                Some(p) => self.blocks[p].clone(),
+                None => BlockHeaderHash::sentinel(),
+            };
+            marf.begin(&parent, &self.blocks[block]).unwrap();
+            let keys: Vec<String> = (0..self.keys_per_block)
+                .map(|k| self.key(block, k))
+                .collect();
+            let values = (0..self.keys_per_block)
+                .map(|k| self.value(block, k))
+                .collect();
+            marf.insert_batch(&keys, values).unwrap();
+            marf.commit().unwrap();
+        }
+    }
 }
