@@ -400,6 +400,9 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         }
         self.open_chain_tip.take();
         self.storage.drop_extending_trie();
+        // squashing rewrote `marf_data` rows in place (blob offsets), so nothing cached from
+        // before can be trusted
+        self.storage.clear_node_cache();
         self.storage.commit_tx();
         Ok(())
     }

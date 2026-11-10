@@ -96,7 +96,7 @@ impl<K: Display, V: Display> Display for LruCache<K, V> {
     }
 }
 
-impl<K: Eq + std::hash::Hash + Clone, V: Copy> LruCache<K, V> {
+impl<K: Eq + std::hash::Hash + Clone, V: Clone> LruCache<K, V> {
     /// Create a new LRU cache with the given capacity (> 0)
     pub fn new(mut capacity: usize) -> Self {
         if capacity == 0 {
@@ -113,13 +113,23 @@ impl<K: Eq + std::hash::Hash + Clone, V: Copy> LruCache<K, V> {
         }
     }
 
-    /// Get the value for the given key
+    /// Number of entries currently in the cache
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Is the cache empty?
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// Get (a clone of) the value for the given key
     /// Returns an error iff the cache is corrupted and should be discarded
     pub fn get(&mut self, key: &K) -> Result<Option<V>, LruCacheCorrupted> {
         if let Some(&index) = self.cache.get(key) {
             self.move_to_head(index)?;
             let node = self.order.get(index).ok_or(LruCacheCorrupted)?;
-            Ok(Some(node.value))
+            Ok(Some(node.value.clone()))
         } else {
             Ok(None)
         }
@@ -169,7 +179,7 @@ impl<K: Eq + std::hash::Hash + Clone, V: Copy> LruCache<K, V> {
 
                 // Save the evicted key-value pair, if it was dirty
                 if tail_node.dirty {
-                    evicted = Some((replaced_key, tail_node.value));
+                    evicted = Some((replaced_key, tail_node.value.clone()));
                 };
 
                 // Update the evicted node with the new key-value pair
@@ -211,7 +221,7 @@ impl<K: Eq + std::hash::Hash + Clone, V: Copy> LruCache<K, V> {
         mut f: impl FnMut(&K, V) -> Result<(), E>,
     ) -> Result<(), FlushError<E>> {
         for node in self.order.iter_mut().filter(|n| n.dirty) {
-            f(&node.key, node.value)?;
+            f(&node.key, node.value.clone())?;
             node.dirty = false;
         }
         Ok(())
@@ -398,6 +408,54 @@ mod tests {
 
         flushed.sort();
         assert_eq!(flushed, [(2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn test_lru_cache_non_copy_value() {
+        let mut cache: LruCache<u32, String> = LruCache::new(2);
+
+        cache.insert(1, "one".to_string()).expect("cache corrupted");
+        cache.insert(2, "two".to_string()).expect("cache corrupted");
+
+        // `get` returns an owned clone; the cached value is unaffected by mutating it
+        let mut got = cache
+            .get(&1)
+            .expect("cache corrupted")
+            .expect("missing key");
+        assert_eq!(got, "one");
+        got.push_str("-mutated");
+        assert_eq!(
+            cache.get(&1).expect("cache corrupted"),
+            Some("one".to_string())
+        );
+
+        // Update replaces the value
+        cache.insert(1, "uno".to_string()).expect("cache corrupted");
+        assert_eq!(
+            cache.get(&1).expect("cache corrupted"),
+            Some("uno".to_string())
+        );
+
+        // Key 2 is now least recently used, so inserting key 3 evicts it
+        let evicted = cache
+            .insert(3, "three".to_string())
+            .expect("cache corrupted")
+            .expect("expected an eviction");
+        assert_eq!(evicted, (2, "two".to_string()));
+        assert_eq!(cache.get(&2).expect("cache corrupted"), None);
+
+        let mut flushed = Vec::new();
+        cache
+            .flush(|k, v| {
+                flushed.push((*k, v));
+                Ok::<(), ()>(())
+            })
+            .expect("cache corrupted or flush failed");
+        flushed.sort();
+        assert_eq!(
+            flushed,
+            vec![(1, "uno".to_string()), (3, "three".to_string())]
+        );
     }
 
     #[test]

@@ -39,7 +39,8 @@ use crate::cache::*;
 use crate::file::{TrieFile, TrieFileNodeHashReader};
 use crate::marf::MARFOpenOpts;
 use crate::node::{
-    is_backptr, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch, TrieNodeType, TriePtr,
+    clear_compressed, is_backptr, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch,
+    TrieNodeType, TriePtr,
 };
 use crate::trie::Trie;
 use crate::{
@@ -847,7 +848,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
         let cur_block = storage_tx.get_cur_block();
         let old_node_res: Result<TrieNodeType, Error> = (|| {
             storage_tx.open_block(&base_ptr.block_id())?;
-            let node = storage_tx.read_nodetype_nohash(base_ptr.ptr())?;
+            // Uncached: the patches written to disk must not depend on cache state.
+            let node = storage_tx.read_nodetype_nohash_uncached(base_ptr.ptr())?;
             Ok(node)
         })();
 
@@ -881,7 +883,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     *base_ptr.ptr(),
                     false,
                 ) {
-                    Ok((base_node, _)) => {
+                    Ok((base_node, _, _)) => {
                         if base_node.path_bytes() != node.path_bytes() {
                             return Ok(None);
                         }
@@ -1431,6 +1433,8 @@ pub struct TrieStorageConnection<'a, T: MarfTrieId> {
     blobs: Option<&'a mut TrieFile>,
     data: &'a mut TrieStorageTransientData<T>,
     cache: &'a mut BlockHashCache<T>,
+    /// Cache of committed nodes reconstructed from patch chains; see [`PatchedNodeCache`].
+    node_cache: &'a mut PatchedNodeCache<T>,
     pub hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
 
@@ -1512,6 +1516,8 @@ pub struct TrieFileStorage<T: MarfTrieId> {
     blobs: Option<TrieFile>,
     data: TrieStorageTransientData<T>,
     cache: BlockHashCache<T>,
+    /// Cache of committed nodes reconstructed from patch chains; starts empty on every open
+    node_cache: PatchedNodeCache<T>,
     hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
 
@@ -1556,6 +1562,8 @@ pub struct ReopenedTrieStorageConnection<'a, T: MarfTrieId> {
     blobs: Option<TrieFile>,
     data: TrieStorageTransientData<T>,
     cache: BlockHashCache<T>,
+    /// Cache of committed nodes reconstructed from patch chains; starts empty on every open
+    node_cache: PatchedNodeCache<T>,
     pub hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
 
@@ -1577,6 +1585,7 @@ impl<'a, T: MarfTrieId> ReopenedTrieStorageConnection<'a, T> {
             data: &mut self.data,
             blobs: self.blobs.as_mut(),
             cache: &mut self.cache,
+            node_cache: &mut self.node_cache,
             hash_calculation_mode: self.hash_calculation_mode,
             unconfirmed_block_id: None,
             compress: self.compress,
@@ -1609,12 +1618,15 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
     }
 
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
+        // a transaction that was dropped without being committed was rolled back by SQLite
+        self.node_cache.clear_if_tx_abandoned();
         TrieStorageConnection {
             db: SqliteConnection::ConnRef(&self.db),
             db_path: &self.db_path,
             data: &mut self.data,
             blobs: self.blobs.as_mut(),
             cache: &mut self.cache,
+            node_cache: &mut self.node_cache,
             hash_calculation_mode: self.hash_calculation_mode,
             unconfirmed_block_id: None,
             compress: self.compress,
@@ -1652,6 +1664,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         };
         // perf note: should we attempt to clone the cache
         let cache = BlockHashCache::new();
+        let node_cache = PatchedNodeCache::new();
         let blobs = if self.blobs.is_some() {
             Some(TrieFile::from_db_path(&self.db_path, true)?)
         } else {
@@ -1664,6 +1677,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             blobs,
             data,
             cache,
+            node_cache,
             hash_calculation_mode,
             compress: self.compress,
             #[cfg(test)]
@@ -1677,12 +1691,18 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         }
         let tx = tx_begin_immediate(&mut self.db)?;
 
+        // a previous transaction that was dropped without being committed was rolled back
+        self.node_cache.clear_if_tx_abandoned();
+        // nodes read from rows written by this transaction must not outlive a rollback
+        self.node_cache.begin_tx();
+
         Ok(TrieStorageTransaction(TrieStorageConnection {
             db: SqliteConnection::Tx(tx),
             db_path: &self.db_path,
             data: &mut self.data,
             blobs: self.blobs.as_mut(),
             cache: &mut self.cache,
+            node_cache: &mut self.node_cache,
             hash_calculation_mode: self.hash_calculation_mode,
             compress: self.compress,
             unconfirmed_block_id: None,
@@ -1797,6 +1817,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             db_path,
             db,
             cache,
+            node_cache: PatchedNodeCache::new(),
             blobs,
             hash_calculation_mode: marf_opts.hash_calculation_mode,
             compress: marf_opts.compress,
@@ -1888,6 +1909,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             db,
             blobs,
             cache,
+            node_cache: PatchedNodeCache::new(),
             hash_calculation_mode: self.hash_calculation_mode,
             compress: self.compress,
 
@@ -1948,6 +1970,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
             db,
             blobs,
             cache,
+            node_cache: PatchedNodeCache::new(),
             hash_calculation_mode: self.hash_calculation_mode,
             compress: self.compress,
 
@@ -2255,6 +2278,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
 
         // blow away db
         trie_sql::clear_tables(self.sqlite_tx())?;
+        self.node_cache.clear();
 
         if let Some((_, ref mut trie_storage)) = self.data.uncommitted_writes {
             trie_storage.format()?
@@ -2291,6 +2315,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     }
 
     pub fn commit_tx(self) {
+        self.0.node_cache.mark_committed();
         match self.0.db {
             SqliteConnection::Tx(tx) => {
                 tx.commit().expect("CORRUPTION: Failed to commit MARF");
@@ -2312,6 +2337,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     }
 
     pub fn rollback(self) {
+        self.0.node_cache.abort_tx();
         match self.0.db {
             SqliteConnection::Tx(tx) => {
                 tx.rollback().expect("CORRUPTION: Failed to commit MARF");
@@ -3012,13 +3038,37 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
 
     /// Read a persisted node and its hash.
     pub fn read_nodetype(&mut self, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash), Error> {
-        self.read_nodetype_maybe_hash(ptr, true)
+        self.read_nodetype_inner(ptr, true, true)
     }
 
     /// Read a persisted node
     pub fn read_nodetype_nohash(&mut self, ptr: &TriePtr) -> Result<TrieNodeType, Error> {
-        self.read_nodetype_maybe_hash(ptr, false)
+        self.read_nodetype_inner(ptr, false, true)
             .map(|(node, _)| node)
+    }
+
+    /// Like [`Self::read_nodetype_nohash`], but never consults or fills the patched-node cache.
+    /// Used when creating patches, so that what gets written to disk (and any error seen while
+    /// creating it) cannot depend on cache state.
+    fn read_nodetype_nohash_uncached(&mut self, ptr: &TriePtr) -> Result<TrieNodeType, Error> {
+        self.read_nodetype_inner(ptr, false, false)
+            .map(|(node, _)| node)
+    }
+
+    /// Drop every cached patched node.
+    pub(crate) fn clear_node_cache(&mut self) {
+        self.node_cache.clear();
+    }
+
+    /// Direct access to the patched-node cache, for tests.
+    #[cfg(test)]
+    pub(crate) fn node_cache_mut(&mut self) -> &mut PatchedNodeCache<T> {
+        self.node_cache
+    }
+
+    /// Return and reset the patched-node cache counters.
+    pub fn node_cache_stats(&mut self) -> PatchedNodeCacheStats {
+        self.node_cache.take_stats()
     }
 
     /// Inner loop of [`TrieStorageConnection::inner_read_patched_persisted_nodetype`]
@@ -3069,12 +3119,14 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     /// Inner method for reading a node, and optionally its hash as well.
     /// Uses either the DB or the .blobs file, depending on which is configured.
     /// If `read_hash` is `false`, then the returned hash is just the empty hash of all 0's.
+    ///
+    /// On success, also returns the number of patches that were applied to the base node.
     fn inner_read_patched_persisted_nodetype(
         &mut self,
         mut block_id: u32,
         mut ptr: TriePtr,
         read_hash: bool,
-    ) -> Result<(TrieNodeType, TrieHash), Error> {
+    ) -> Result<(TrieNodeType, TrieHash, usize), Error> {
         trace!(
             "inner_read_patched_persisted_nodetype({block_id}): {ptr:?} (unconfirmed={:?},{})",
             &self.unconfirmed_block_id,
@@ -3090,10 +3142,11 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             match self.inner_read_persisted_nodetype(block_id, &ptr, read_hash) {
                 Ok((node, hash)) => {
                     patches.reverse();
+                    let num_patches = patches.len();
                     let node = node.apply_patches(&patches, cur_block_id).ok_or_else(|| {
                         Error::CorruptionError("Failed to apply patches to node".to_string())
                     })?;
-                    return Ok((node, node_hash_opt.unwrap_or(hash)));
+                    return Ok((node, node_hash_opt.unwrap_or(hash), num_patches));
                 }
                 Err(Error::Patch(hash_opt, node_patch)) => {
                     trace!(
@@ -3124,10 +3177,17 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     /// currently-open trie.  However, if ptr refers to a patch node, then the base node and the
     /// one or more patch nodes written atop it will be loaded and used to reconstruct the new
     /// node.
-    fn read_nodetype_maybe_hash(
+    ///
+    /// If `use_cache` is true, a node that needs patches applied is served from, and added to,
+    /// the patched-node cache.  Only committed, confirmed rows are ever cached: nothing is cached
+    /// for unconfirmed storages or for the unconfirmed trie, whose rows are rewritten in place.
+    /// Switching the open block (`open_block*`) needs no invalidation, because the key names the
+    /// block the node is read from.
+    fn read_nodetype_inner(
         &mut self,
         ptr: &TriePtr,
         read_hash: bool,
+        use_cache: bool,
     ) -> Result<(TrieNodeType, TrieHash), Error> {
         trace!("read_nodetype({:?}): {:?}", &self.data.cur_block, ptr);
 
@@ -3153,9 +3213,35 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         // some other block
         match self.data.cur_block_id {
             Some(id) => {
-                let (node_inst, node_hash) =
-                    self.inner_read_patched_persisted_nodetype(id, clear_ptr, read_hash)?;
+                let cacheable = use_cache
+                    && !self.data.unconfirmed
+                    && self.unconfirmed_block_id != Some(id)
+                    && clear_compressed(clear_ptr.id()) != TrieNodeID::Leaf as u8;
+                if !cacheable {
+                    let (node_inst, node_hash, _) =
+                        self.inner_read_patched_persisted_nodetype(id, clear_ptr, read_hash)?;
+                    return Ok((node_inst, node_hash));
+                }
 
+                let key = PatchedNodeKey {
+                    block_hash: self.data.cur_block.clone(),
+                    block_id: id,
+                    node_id: clear_ptr.id(),
+                    ptr: clear_ptr.ptr(),
+                };
+                if let Some(hit) = self.node_cache.get(&key, read_hash) {
+                    return Ok(hit);
+                }
+
+                let (node_inst, node_hash, num_patches) =
+                    self.inner_read_patched_persisted_nodetype(id, clear_ptr, read_hash)?;
+                if num_patches > 0 {
+                    self.node_cache.note_reconstruction();
+                    // a read that skipped the hash returned a placeholder, which must not be
+                    // stored as if it were real
+                    self.node_cache
+                        .insert(key, &node_inst, read_hash.then_some(node_hash));
+                }
                 Ok((node_inst, node_hash))
             }
             None => {

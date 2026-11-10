@@ -16,8 +16,9 @@
 //! MARF performance tests intended to be run manually for analysis.
 
 use std::fs;
+use std::time::Instant;
 
-use stacks_common::types::chainstate::{BlockHeaderHash, TrieHash};
+use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::to_hex;
 
@@ -243,4 +244,143 @@ fn marf_read_random_1048576_4096_file_storage() {
             }
         }
     }
+}
+
+/// Compare repeated lookups with the patched-node cache off and on.
+///
+/// Builds a compressed MARF (the only kind with patch nodes) with a fork, from seeded pseudo-random
+/// keys, then repeatedly looks keys up at the tip, at historical tips and at the fork's tip.  The
+/// same lookups run against two identical storages, one with the cache disabled.  Reports wall
+/// time, nodes read, nodes rebuilt from patch chains and the cache hit rate, and checks that both
+/// storages return the same values.  Run with:
+///
+/// `cargo test -p stacks-marf --release --lib marf_perfs::patched_node_cache -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn patched_node_cache_off_vs_on() {
+    const NUM_KEYS: u64 = 20_000;
+    const REWRITES_PER_BLOCK: u64 = 400;
+    const NUM_BLOCKS: u8 = 12;
+    const FORK_FROM: u8 = 6;
+    const FORK_BLOCKS: u8 = 4;
+    const LOOKUPS_PER_TIP: u64 = 20_000;
+    const PASSES: usize = 3;
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+    fn path_for(i: u64) -> TrieHash {
+        TrieHash::from_data(&i.to_be_bytes())
+    }
+    fn blk(n: u8) -> StacksBlockId {
+        StacksBlockId([n; 32])
+    }
+
+    // (block, parent) in creation order: a chain, then a fork off the middle of it
+    let mut plan: Vec<(StacksBlockId, StacksBlockId)> = vec![(blk(1), StacksBlockId::sentinel())];
+    for n in 2..=NUM_BLOCKS {
+        plan.push((blk(n), blk(n - 1)));
+    }
+    for n in 0..FORK_BLOCKS {
+        let parent = if n == 0 {
+            blk(FORK_FROM)
+        } else {
+            blk(100 + n - 1)
+        };
+        plan.push((blk(100 + n), parent));
+    }
+    let tips = [
+        blk(NUM_BLOCKS),
+        blk(9),
+        blk(FORK_FROM),
+        blk(100 + FORK_BLOCKS - 1),
+    ];
+
+    let mut results = vec![];
+    for cache_enabled in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marf.sqlite");
+        let storage = TrieFileStorage::<StacksBlockId>::open(
+            db_path.to_str().unwrap(),
+            MARFOpenOpts::default().with_compression(true),
+        )
+        .unwrap();
+        let mut marf = MARF::from_storage(storage);
+        marf.borrow_storage_backend()
+            .node_cache_mut()
+            .set_enabled(cache_enabled);
+
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        for (n, (b, parent)) in plan.iter().enumerate() {
+            marf.begin(parent, b).unwrap();
+            let count = if n == 0 { NUM_KEYS } else { REWRITES_PER_BLOCK };
+            for j in 0..count {
+                let i = if n == 0 {
+                    j
+                } else {
+                    next(&mut seed) % NUM_KEYS
+                };
+                let mut data = [n as u8; 40];
+                data[..8].copy_from_slice(&i.to_be_bytes());
+                marf.insert_raw(path_for(i), TrieLeaf::new(&[], &data))
+                    .unwrap();
+            }
+            marf.commit_to(b).unwrap();
+        }
+
+        // identical lookups for both runs
+        let mut seed = 0xD1B54A32D192ED03u64;
+        marf.borrow_storage_backend().node_cache_stats();
+        marf.borrow_storage_backend().node_stats();
+        let mut checksum = 0u64;
+        let start = Instant::now();
+        for _ in 0..PASSES {
+            for tip in tips.iter() {
+                for _ in 0..LOOKUPS_PER_TIP {
+                    let i = next(&mut seed) % NUM_KEYS;
+                    let leaf =
+                        MARF::get_path(&mut marf.borrow_storage_backend(), tip, &path_for(i))
+                            .unwrap()
+                            .unwrap();
+                    checksum =
+                        checksum.wrapping_add(leaf.data.0.iter().map(|b| *b as u64).sum::<u64>());
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        let stats = marf.borrow_storage_backend().node_cache_stats();
+        let (node_reads, backptr_reads, _) = marf.borrow_storage_backend().node_stats();
+        let lookups = (PASSES * tips.len()) as u64 * LOOKUPS_PER_TIP;
+        let hit_rate = if stats.hits + stats.misses > 0 {
+            100.0 * stats.hits as f64 / (stats.hits + stats.misses) as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "cache {}: {lookups} lookups in {elapsed:?} ({:.2} us/lookup); node reads {}, backptr reads {}, \
+             patch reconstructions {}, cache hits {} misses {} (hit rate {hit_rate:.1}%), inserts {}",
+            if cache_enabled { "on " } else { "off" },
+            elapsed.as_secs_f64() * 1e6 / lookups as f64,
+            node_reads,
+            backptr_reads,
+            stats.reconstructions,
+            stats.hits,
+            stats.misses,
+            stats.inserts,
+        );
+        results.push((checksum, stats, elapsed));
+    }
+
+    assert_eq!(
+        results[0].0, results[1].0,
+        "cached and uncached lookups disagree"
+    );
+    assert!(results[1].1.reconstructions <= results[0].1.reconstructions);
+    eprintln!(
+        "reconstructions: {} -> {}; time: {:?} -> {:?}",
+        results[0].1.reconstructions, results[1].1.reconstructions, results[0].2, results[1].2
+    );
 }

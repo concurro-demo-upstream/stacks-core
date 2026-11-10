@@ -1,0 +1,1 @@
+MARF reads now keep a bounded in-memory cache (16 MiB budget) of committed nodes that were reconstructed from patch chains, so repeated lookups through shared parts of the trie avoid rebuilding them; nothing changes on disk, in node encoding, in hashes or proofs, or in consensus.
