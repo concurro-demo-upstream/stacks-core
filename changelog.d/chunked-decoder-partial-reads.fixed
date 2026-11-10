@@ -1,0 +1,1 @@
+Fixed the chunked HTTP transfer decoder losing already-decoded body bytes when the underlying reader pauses (e.g. `WouldBlock` or `Interrupted`), treating a truncated chunked body as a complete one, and panicking on a retry after malformed input.

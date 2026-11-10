@@ -20,7 +20,10 @@ use std::{error, fmt, io};
 use crate::codec::MAX_MESSAGE_LEN;
 use crate::deps_common::httparse;
 
-/// NOTE: it is imperative that the given Read and Write impls here _never_ fail with EWOULDBLOCK.
+/// NOTE: the Write impl here must _never_ fail with EWOULDBLOCK.  The Read impl may be fed by a
+/// reader that fails transiently (e.g. EWOULDBLOCK, EINTR): bytes consumed before such a failure
+/// are never lost, and the error is not stored or replayed.  See
+/// [`HttpChunkedTransferReaderState::do_read`] for the exact contract.
 
 #[derive(Debug)]
 pub enum ChunkedError {
@@ -53,6 +56,22 @@ enum HttpChunkedTransferParseMode {
     Chunk,
     ChunkTrailer,
     EOF,
+    /// The input was malformed or too large.  The decoder never recovers from this.
+    Failed,
+}
+
+/// Why `HttpChunkedTransferReaderState::decode` stopped reading.
+#[derive(Debug)]
+enum DecodeStop {
+    /// The output buffer is full.
+    BufferFull,
+    /// The final chunk has been read; nothing past it is consumed.
+    Finished,
+    /// The underlying reader returned 0 bytes before the final chunk.
+    InputEnded,
+    /// The underlying reader failed (e.g. EWOULDBLOCK, EINTR).  No decoder state was changed by
+    /// the failed read.
+    ReaderError(io::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -133,6 +152,7 @@ impl HttpChunkedTransferReaderState {
 
         if self.i >= self.chunk_buffer.len() {
             // don't allow ridiculous extension lengths
+            self.parse_step = HttpChunkedTransferParseMode::Failed;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 ChunkedError::DeserializeError("Invalid HTTP chunk boundary: too long".to_string()),
@@ -149,6 +169,7 @@ impl HttpChunkedTransferReaderState {
                     "Invalid chunk boundary: {:?}",
                     self.chunk_buffer[0..self.i].to_vec()
                 );
+                self.parse_step = HttpChunkedTransferParseMode::Failed;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid HTTP chunk boundary: could not parse".to_string(),
@@ -159,6 +180,7 @@ impl HttpChunkedTransferReaderState {
         trace!("chunk offset: {offset}. chunk len: {chunk_len}");
         if chunk_len > MAX_MESSAGE_LEN as u64 {
             trace!("chunk buffer: {:?}", &self.chunk_buffer[0..self.i]);
+            self.parse_step = HttpChunkedTransferParseMode::Failed;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 ChunkedError::DeserializeError("Invalid HTTP chunk: too big".to_string()),
@@ -186,6 +208,7 @@ impl HttpChunkedTransferReaderState {
         assert_eq!(self.parse_step, HttpChunkedTransferParseMode::Chunk);
 
         if self.total_size >= self.max_size && self.chunk_size > 0 {
+            self.parse_step = HttpChunkedTransferParseMode::Failed;
             return Err(io::Error::other(ChunkedError::OverflowError(
                 "HTTP body exceeds maximum expected length".to_string(),
             )));
@@ -250,6 +273,7 @@ impl HttpChunkedTransferReaderState {
         if self.i == 2 {
             // expect '\r\n'
             if self.chunk_buffer[0..2] != [0x0d, 0x0a] {
+                self.parse_step = HttpChunkedTransferParseMode::Failed;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     ChunkedError::DeserializeError("Invalid chunk trailer".to_string()),
@@ -268,56 +292,136 @@ impl HttpChunkedTransferReaderState {
         Ok(nr)
     }
 
-    /// Read from a Read.
-    /// Returns (number of bytes decoded, number of bytes consumed from the Read)
-    pub fn do_read<R: Read>(&mut self, fd: &mut R, buf: &mut [u8]) -> io::Result<(usize, usize)> {
+    /// Decode from `fd` into `buf` until `buf` is full, the final chunk has been read, `fd` has
+    /// no more data, or `fd` fails.
+    /// Returns (number of bytes decoded, number of bytes consumed from `fd`, why we stopped).
+    ///
+    /// # Errors
+    ///
+    /// Only decoder errors are returned as `Err` (malformed or oversized input, or a decoder that
+    /// already failed).  They put the decoder in a permanent failed state.  Failures of `fd` itself
+    /// are reported as `DecodeStop::ReaderError` together with the progress made before them.
+    fn decode<R: Read>(
+        &mut self,
+        fd: &mut R,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, usize, DecodeStop)> {
+        if self.parse_step == HttpChunkedTransferParseMode::Failed {
+            return Err(Self::failed_error());
+        }
+
         let mut decoded = 0;
         let mut consumed = 0;
-        while decoded < buf.len() {
-            match self.parse_step {
-                HttpChunkedTransferParseMode::ChunkBoundary => {
-                    let count = self.read_chunk_boundary(fd)?;
-                    if count == 0 {
-                        break;
-                    }
-                    consumed += count;
-                }
+        let stop = loop {
+            if decoded >= buf.len() {
+                break DecodeStop::BufferFull;
+            }
+            // `fd.read()` errors occur before any state change, so it is safe to stop here and
+            // report the progress made so far.  A failed state means the decoder itself erred.
+            let mode = self.parse_step;
+            let step = match mode {
+                HttpChunkedTransferParseMode::ChunkBoundary => self.read_chunk_boundary(fd),
                 HttpChunkedTransferParseMode::Chunk => {
-                    let nr = self.read_chunk_bytes(fd, &mut buf[decoded..])?;
-                    if nr == 0 && self.parse_step == HttpChunkedTransferParseMode::Chunk {
+                    self.read_chunk_bytes(fd, &mut buf[decoded..])
+                }
+                HttpChunkedTransferParseMode::ChunkTrailer => self.read_chunk_trailer(fd),
+                HttpChunkedTransferParseMode::EOF => break DecodeStop::Finished,
+                HttpChunkedTransferParseMode::Failed => return Err(Self::failed_error()),
+            };
+            let count = match step {
+                Ok(count) => count,
+                Err(e) if self.parse_step == HttpChunkedTransferParseMode::Failed => return Err(e),
+                Err(e) => break DecodeStop::ReaderError(e),
+            };
+
+            match mode {
+                HttpChunkedTransferParseMode::Chunk => {
+                    if count == 0 && self.parse_step == HttpChunkedTransferParseMode::Chunk {
                         // still trying to read the chunk, but got 0 bytes
-                        break;
+                        break DecodeStop::InputEnded;
                     }
-                    decoded += nr;
-                    consumed += nr;
+                    decoded += count;
                 }
-                HttpChunkedTransferParseMode::ChunkTrailer => {
-                    let count = self.read_chunk_trailer(fd)?;
+                _ => {
                     if count == 0 {
-                        break;
+                        break DecodeStop::InputEnded;
                     }
-                    consumed += count;
-                    if self.last_chunk_size == 0 {
-                        // we're done
-                        trace!("finished last chunk");
-                        self.parse_step = HttpChunkedTransferParseMode::EOF;
-                        break;
-                    }
-                }
-                HttpChunkedTransferParseMode::EOF => {
-                    break;
                 }
             }
+            consumed += count;
+
+            if mode == HttpChunkedTransferParseMode::ChunkTrailer && self.last_chunk_size == 0 {
+                // we're done
+                trace!("finished last chunk");
+                self.parse_step = HttpChunkedTransferParseMode::EOF;
+                break DecodeStop::Finished;
+            }
+        };
+        Ok((decoded, consumed, stop))
+    }
+
+    fn failed_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            ChunkedError::DeserializeError("HTTP chunked decoder already failed".to_string()),
+        )
+    }
+
+    /// Read from a Read.
+    /// Returns (number of bytes decoded, number of bytes consumed from the Read)
+    ///
+    /// Decoding resumes where it left off on the next call, however the input is split.
+    /// Bytes past the final chunk are never read.
+    ///
+    /// # Errors
+    ///
+    /// - If `fd` fails (e.g. `WouldBlock`, `Interrupted`) after progress was made in this call,
+    ///   the progress is returned as `Ok` and the error is dropped; it is seen again only if `fd`
+    ///   reports it again.  If `fd` fails with no progress, its error is returned and the state is
+    ///   unchanged.
+    /// - Malformed input or exceeding `max_size` is an error, and the decoder fails permanently:
+    ///   every later call returns `InvalidData` without reading.
+    ///
+    /// `fd` returning 0 bytes before the final chunk is not an error here; it yields fewer bytes.
+    /// Callers can tell completion from a pause with `is_eof()`.
+    pub fn do_read<R: Read>(&mut self, fd: &mut R, buf: &mut [u8]) -> io::Result<(usize, usize)> {
+        match self.decode(fd, buf)? {
+            (0, 0, DecodeStop::ReaderError(e)) => Err(e),
+            (decoded, consumed, _) => Ok((decoded, consumed)),
         }
-        Ok((decoded, consumed))
     }
 }
 
 impl<R: Read> Read for HttpChunkedTransferReader<'_, R> {
     /// Read a HTTP chunk-encoded stream.
     /// Returns number of decoded bytes (i.e. number of bytes copied to buf, as expected)
+    ///
+    /// Returns `Ok(0)` only if `buf` is empty or the stream is complete.  Bytes decoded before
+    /// the underlying reader fails are returned as `Ok`; if nothing was decoded, the reader's
+    /// error is returned and decoding can be retried.
+    ///
+    /// # Errors
+    ///
+    /// - `UnexpectedEof` if the underlying reader ends before the final chunk.
+    /// - `InvalidData` or another error on malformed or oversized input; this is permanent.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.state.do_read(self.fd, buf).map(|(decoded, _)| decoded)
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (decoded, _, stop) = self.state.decode(self.fd, buf)?;
+        if decoded > 0 {
+            return Ok(decoded);
+        }
+        match stop {
+            DecodeStop::ReaderError(e) => Err(e),
+            DecodeStop::InputEnded => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                ChunkedError::DeserializeError(
+                    "HTTP chunked stream ended before the final chunk".to_string(),
+                ),
+            )),
+            DecodeStop::Finished | DecodeStop::BufferFull => Ok(0),
+        }
     }
 }
 
@@ -701,7 +805,11 @@ mod test {
             ("ffffffff\r\n", 1, "too big"),
             ("nope\r\n", 1, "could not parse"),
             ("1\na\r\n0\r\n\r\n", 1, "could not parse"),
-            ("a\r\naaaaaaaaaa", 11, "failed to fill whole buffer"),
+            (
+                "a\r\naaaaaaaaaa",
+                11,
+                "HTTP chunked stream ended before the final chunk",
+            ),
             ("1\r\nab\r\n0\r\n\r\n", 2, "Invalid chunk trailer"),
             (
                 "15\r\naaaaaaaaaabbbbbbbbbbb\r\n0\r\n\r\n",
@@ -727,6 +835,290 @@ mod test {
                 errstr.contains(expected),
                 "Expected '{expected}' in '{errstr:?}'"
             );
+        }
+    }
+
+    /// One step of a `ScriptedReader`.
+    enum Step {
+        Data(&'static str),
+        WouldBlock,
+        Interrupted,
+    }
+
+    /// Reader that replays data segments (short reads at segment boundaries) and transient
+    /// errors in order, then reports end of input.
+    struct ScriptedReader {
+        steps: std::collections::VecDeque<Step>,
+        /// offset into the front `Step::Data` segment
+        offset: usize,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: Vec<Step>) -> ScriptedReader {
+            ScriptedReader {
+                steps: steps.into(),
+                offset: 0,
+            }
+        }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            // an empty segment is not end of input
+            while matches!(self.steps.front(), Some(Step::Data(d)) if d.is_empty()) {
+                self.steps.pop_front();
+            }
+            match self.steps.front() {
+                None => Ok(0),
+                Some(Step::WouldBlock) => {
+                    self.steps.pop_front();
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+                Some(Step::Interrupted) => {
+                    self.steps.pop_front();
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                }
+                Some(Step::Data(data)) => {
+                    let remaining = &data.as_bytes()[self.offset..];
+                    let n = remaining.len().min(buf.len());
+                    buf[..n].copy_from_slice(&remaining[..n]);
+                    self.offset += n;
+                    if self.offset >= data.len() {
+                        self.steps.pop_front();
+                        self.offset = 0;
+                    }
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    /// Decode with `do_read`, retrying on `WouldBlock`/`Interrupted`, until EOF or the reader
+    /// ends.  Returns (decoded bytes, consumed bytes).
+    fn drain_do_read(
+        state: &mut HttpChunkedTransferReaderState,
+        fd: &mut ScriptedReader,
+    ) -> (Vec<u8>, usize) {
+        let mut out = vec![];
+        let mut total_consumed = 0;
+        loop {
+            let mut buf = [0u8; 64];
+            match state.do_read(fd, &mut buf) {
+                Ok((decoded, consumed)) => {
+                    out.extend_from_slice(&buf[..decoded]);
+                    total_consumed += consumed;
+                    if state.is_eof() || (decoded == 0 && consumed == 0) {
+                        return (out, total_consumed);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_http_chunked_decode_keeps_progress_across_pause() {
+        let mut fd = ScriptedReader::new(vec![
+            Step::Data("a\r\naaaaa"),
+            Step::WouldBlock,
+            Step::Data("bbbbb\r\n0\r\n\r\n"),
+        ]);
+        let mut state = HttpChunkedTransferReaderState::new(50);
+        let mut buf = [0u8; 64];
+
+        // the pause comes after 5 body bytes were decoded; they must be reported, not lost
+        assert_eq!(state.do_read(&mut fd, &mut buf).unwrap(), (5, 8));
+        assert_eq!(&buf[..5], b"aaaaa");
+        assert!(!state.is_eof());
+
+        // the error is not replayed
+        assert_eq!(state.do_read(&mut fd, &mut buf).unwrap(), (5, 12));
+        assert_eq!(&buf[..5], b"bbbbb");
+        assert!(state.is_eof());
+    }
+
+    #[test]
+    fn test_http_chunked_decode_pause_without_progress() {
+        let encoded = "a\r\naaaaaaaaaa\r\n0\r\n\r\n";
+
+        // nothing consumed: the reader's error is returned and the state is untouched
+        let mut fd = ScriptedReader::new(vec![Step::WouldBlock, Step::Data(encoded)]);
+        let mut state = HttpChunkedTransferReaderState::new(50);
+        let before = state;
+        let mut buf = [0u8; 64];
+        let err = state.do_read(&mut fd, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(state, before);
+        assert_eq!(
+            state.do_read(&mut fd, &mut buf).unwrap(),
+            (10, encoded.len())
+        );
+        assert!(state.is_eof());
+
+        // only framing bytes consumed before the pause
+        let mut fd = ScriptedReader::new(vec![
+            Step::Data("1\r"),
+            Step::WouldBlock,
+            Step::Data("\na\r\n0\r\n\r\n"),
+        ]);
+        let mut state = HttpChunkedTransferReaderState::new(50);
+        assert_eq!(state.do_read(&mut fd, &mut buf).unwrap(), (0, 2));
+        assert!(!state.is_eof());
+        assert_eq!(state.do_read(&mut fd, &mut buf).unwrap(), (1, 9));
+        assert_eq!(buf[0], b'a');
+        assert!(state.is_eof());
+    }
+
+    /// Splitting the input anywhere, and pausing between the pieces, must not change the output
+    /// or the number of bytes consumed.
+    #[test]
+    fn test_http_chunked_decode_split_equivalence() {
+        // (encoding, expected body, expected consumed bytes)
+        let tests = [
+            (
+                "a\r\naaaaaaaaaa\r\na\r\nbbbbbbbbbb\r\n0\r\n\r\n",
+                "aaaaaaaaaabbbbbbbbbb",
+                35,
+            ),
+            ("A\r\naaaaaaaaaa\r\n0\r\n\r\n", "aaaaaaaaaa", 20),
+            (
+                "1\r\na\r\n2\r\nbb\r\n3\r\nccc\r\n4\r\ndddd\r\n0\r\n\r\n",
+                "abbcccdddd",
+                35,
+            ),
+            ("1\r\na\r\n0\r\n\r\n", "a", 11),
+            // only the first response is consumed
+            ("1\r\na\r\n0\r\n\r\n1\r\nb\r\n0\r\n\r\n", "a", 11),
+            ("1; a; b\r\na\r\n0; c\r\n\r\n", "a", 20),
+            ("1 \t; a\t;\tb ;\r\na\r\n0\t\t;c\r\n\r\n", "a", 26),
+            ("0\r\n\r\n", "", 5),
+        ];
+        for (encoded, expected, expected_consumed) in tests.iter() {
+            assert!(encoded.len() >= *expected_consumed);
+            for split in 0..=encoded.len() {
+                for pause in [Step::WouldBlock, Step::Interrupted] {
+                    let steps = vec![
+                        Step::Data(&encoded[..split]),
+                        match pause {
+                            Step::WouldBlock => Step::WouldBlock,
+                            _ => Step::Interrupted,
+                        },
+                        Step::Data(&encoded[split..]),
+                    ];
+                    let mut fd = ScriptedReader::new(steps);
+                    let mut state = HttpChunkedTransferReaderState::new(50);
+                    let (out, consumed) = drain_do_read(&mut state, &mut fd);
+                    assert_eq!(out, expected.as_bytes(), "{encoded:?} split at {split}");
+                    assert!(state.is_eof(), "{encoded:?} split at {split}");
+                    assert_eq!(consumed, *expected_consumed, "{encoded:?} split at {split}");
+                }
+            }
+
+            // and through the Read adapter, retrying on Interrupted
+            let mut fd = ScriptedReader::new(vec![
+                Step::Data(&encoded[..1]),
+                Step::Interrupted,
+                Step::Data(&encoded[1..]),
+            ]);
+            let mut decoder = HttpChunkedTransferReader::from_reader(&mut fd, 50);
+            let mut out = vec![];
+            decoder.read_to_end(&mut out).unwrap();
+            assert_eq!(out, expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_http_chunked_decode_no_overread() {
+        let first = "a\r\naaaaaaaaaa\r\n0\r\n\r\n";
+        let second = "1\r\nb\r\n0\r\n\r\n";
+        for pause_before_last_crlf in [false, true] {
+            let mut steps = vec![];
+            if pause_before_last_crlf {
+                steps.push(Step::Data(&first[..first.len() - 1]));
+                steps.push(Step::WouldBlock);
+                steps.push(Step::Data(&first[first.len() - 1..]));
+            } else {
+                steps.push(Step::Data(first));
+            }
+            steps.push(Step::Data(second));
+            let mut fd = ScriptedReader::new(steps);
+            let mut state = HttpChunkedTransferReaderState::new(50);
+            let (out, consumed) = drain_do_read(&mut state, &mut fd);
+            assert_eq!(out, b"aaaaaaaaaa");
+            assert_eq!(consumed, first.len());
+            assert!(state.is_eof());
+
+            // the second response is untouched
+            let mut rest = String::new();
+            fd.read_to_string(&mut rest).unwrap();
+            assert_eq!(rest, second);
+        }
+    }
+
+    #[test]
+    fn test_http_chunked_decode_truncated() {
+        for truncated in [
+            "5\r\nab",
+            "1\r\na\r\n",
+            "1\r\na\r\n0\r\n",
+            "1\r\na\r\n0\r\n\r",
+            "",
+        ] {
+            let mut cursor = io::Cursor::new(truncated.as_bytes());
+            let mut decoder = HttpChunkedTransferReader::from_reader(&mut cursor, 50);
+            let mut out = vec![];
+            let err = decoder.read_to_end(&mut out).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{truncated:?}");
+            assert!(
+                err.to_string()
+                    .contains("HTTP chunked stream ended before the final chunk"),
+                "{truncated:?}: {err}"
+            );
+        }
+
+        let mut cursor = io::Cursor::new("0\r\n\r\n".as_bytes());
+        let mut decoder = HttpChunkedTransferReader::from_reader(&mut cursor, 50);
+        let mut out = vec![];
+        decoder.read_to_end(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_http_chunked_decode_failure_is_permanent() {
+        let inputs = [
+            "1; reallyreallyreallyreallylongextension;\r\na\r\n0\r\n\r\n",
+            "ffffffff\r\n",
+            "nope\r\n",
+            "1\r\nab\r\n0\r\n\r\n",
+            "15\r\naaaaaaaaaabbbbbbbbbbb\r\n0\r\n\r\n",
+        ];
+        for input in inputs {
+            let mut fd = ScriptedReader::new(vec![Step::Data(input)]);
+            let mut state = HttpChunkedTransferReaderState::new(20);
+            let mut buf = [0u8; 64];
+            let mut failed = false;
+            for _ in 0..input.len() + 2 {
+                if state.do_read(&mut fd, &mut buf).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            assert!(failed, "{input:?} should fail");
+
+            // further reads fail without panicking or reading
+            let remaining = fd.steps.len();
+            let err = state.do_read(&mut fd, &mut buf).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fd.steps.len(), remaining);
+
+            let mut decoder = HttpChunkedTransferReader::from_state(&mut fd, state);
+            let err = decoder.read(&mut buf).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
     }
 
