@@ -29,10 +29,10 @@ runs:
       uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
       with:
         tool: nextest@0.9.145
-    - name: Check shared crates and MARF integration formatting
+    - name: Check demo crate formatting
       if: inputs.warm-cache != 'true'
       shell: bash
-      run: cargo fmt -p stacks-common -p stacks-marf -p stackslib -- --check
+      run: cargo fmt -p stacks-common -p stacks-marf -p stackslib -p libsigner -- --check
     - name: Build or test the demo selection
       shell: bash
       env:
@@ -43,12 +43,19 @@ runs:
           args+=(--no-run)
         fi
         cargo nextest run --locked \
-          -p stacks-common -p stacks-marf -p stackslib \
+          -p stacks-common -p stacks-marf -p stackslib -p libsigner \
           --features stacks-common/rusqlite \
           --lib --test-threads 4 "${args[@]}" \
-          -E 'package(=stacks-common) | package(=stacks-marf)' \
+          -E 'package(=stacks-common) | package(=stacks-marf) | package(=libsigner)' \
           -E 'package(=stackslib) & test(~clarity_vm::tests::forking::)' \
-          -E 'package(=stackslib) & test(=clarity_vm::tests::ephemeral::test_ephemeral_marf_store)'
+          -E 'package(=stackslib) & test(~clarity_vm::tests::ephemeral::)' \
+          -E 'package(=stackslib) & test(~net::tests::httpcore::)' \
+          -E 'package(=stackslib) & test(~net::http::tests::)' \
+          -E 'package(=stackslib) & test(/^net::api::tests::(getaccount|getmapentry|getdatavar|txsimulate|blockreplay|callreadonly|posttransaction|getinfo)::/)' \
+          -E 'package(=stackslib) & test(~chainstate::stacks::db::snapshot::tests::clarity::)' \
+          -E 'package(=stackslib) & test(~core::tests::)' \
+          -E 'package(=stackslib) & test(~chainstate::stacks::block::)' \
+          -E 'package(=stackslib) & test(~chainstate::stacks::db::transactions::)'
     - name: Save trusted main-branch cache
       if: >-
         inputs.warm-cache == 'true' && steps.cache.outputs.cache-hit != 'true' &&

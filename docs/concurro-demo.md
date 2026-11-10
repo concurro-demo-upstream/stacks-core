@@ -11,26 +11,40 @@ explicitly permitted here. This does not change the real Stacks project's polici
 
 ## Demo CI
 
-`Concurro Demo CI` runs one `Demo Rust` job on an ordinary `ubuntu-24.04` runner:
+`Concurro Demo CI` runs one `Demo Rust` job on an `ubuntu-24.04` runner, including
+on draft pull requests. It tests GitHub's proposed merge commit with a 30-minute
+job timeout, four build jobs and four test threads. Incremental compilation is disabled.
 
-```bash
-cargo fmt -p stacks-common -- --check
-cargo nextest run --locked -p stacks-common --lib --test-threads 4
-```
+The shared [build action](../.github/actions/concurro-demo-rust/action.yml) is the
+source of truth for the test selection. A single Cargo invocation builds the four
+packages together, with `stacks-common/rusqlite` enabled:
 
-It runs on draft pull requests too, testing GitHub's proposed merge commit. It has a
-20-minute timeout and uses no repository secrets, write token, coverage build or
-workspace-wide test matrix. Cold dependency compilation still takes several minutes.
-Its passing result covers `stacks-common`, not the entire Stacks workspace.
+| Package | Library tests |
+| ---- | ---- |
+| `stacks-common` | All |
+| `stacks-marf` | All |
+| `libsigner` | All |
+| `stackslib` | Clarity historical/forking and ephemeral replay; HTTP parsing and routing; account, map-entry, data-variable, simulation, replay, read-only-call, transaction-submission and node-info RPCs; Clarity snapshot storage; core/mempool; block and transaction validation |
 
-The inherited workflows are preserved, inactive, in `.github/upstream-workflows/`.
-Do not restore them or enable the original CI for the demo. There are no automatic
-push or scheduled builds, cache uploads or release jobs in the demo workflows.
+Formatting is checked for all four packages. Ignored tests remain ignored. This is
+focused coverage, not the full workspace, live Bitcoin integration, signer-system
+integration, benchmarks or production-wide validation. New pilots need their test
+areas included before enrollment.
+
+PR jobs only restore caches. A nightly main-branch job (02:23 UTC), also available
+through `workflow_dispatch` on main, builds the same selection with `--no-run` and
+saves the trusted cache; it does not run tests. Cache keys include manifests, the
+lockfile, toolchain, Cargo configuration, build action and workflow. Changes to the
+selection therefore start a new cache family.
+
+Neither job uses repository secrets or write tokens. Only the trusted main-branch
+warmer saves caches. The inherited workflows remain inactive in
+`.github/upstream-workflows/`; they are not part of demo CI.
 
 ## Pilot tasks
 
-Start with documentation or a focused `stacks-common` change. Agents may run additional
-checks, but must report what actually ran. The target's instructions describe the
+Choose a focused task whose relevant tests are covered by demo CI. Agents may run
+additional checks, but must report what actually ran. The target's instructions describe the
 representative CI scope; production-wide validation is not implied by demo readiness.
 
 Enroll a fresh issue in the demo upstream with the `concurro` label after the service
