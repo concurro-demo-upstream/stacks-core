@@ -280,25 +280,27 @@ impl NakamotoBlockBuilder {
             }
         }
 
+        let header = NakamotoBlockHeader::from_parent_empty(
+            next_height,
+            total_burn,
+            tenure_id_consensus_hash.clone(),
+            parent_stacks_header.index_block_hash(),
+            bitvec_len,
+            parent_stacks_header
+                .anchored_header
+                .as_stacks_nakamoto()
+                .map(|b| b.timestamp)
+                .unwrap_or(0),
+            timestamp.unwrap_or(get_epoch_time_secs()),
+        )?;
+
         Ok(NakamotoBlockBuilder {
             parent_header: Some(parent_stacks_header.clone()),
             coinbase_tx: coinbase.cloned(),
             matured_miner_rewards_opt: None,
             bytes_so_far: 0,
             txs: vec![],
-            header: NakamotoBlockHeader::from_parent_empty(
-                next_height,
-                total_burn,
-                tenure_id_consensus_hash.clone(),
-                parent_stacks_header.index_block_hash(),
-                bitvec_len,
-                parent_stacks_header
-                    .anchored_header
-                    .as_stacks_nakamoto()
-                    .map(|b| b.timestamp)
-                    .unwrap_or(0),
-                timestamp.unwrap_or(get_epoch_time_secs()),
-            ),
+            header,
             soft_limit,
             contract_limit_percentage,
             max_tenure_bytes,

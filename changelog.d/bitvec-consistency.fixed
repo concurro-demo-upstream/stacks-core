@@ -1,0 +1,3 @@
+`BitVec::zeros(0)` and `BitVec::ones(0)` now return an error, since an empty `BitVec` cannot be deserialized.
+`BitVec` equality now compares the length and logical bits, ignoring unused padding bits in the last byte; the consensus encoding is unchanged.
+Decoding a `BitVec` from JSON or SQLite now rejects trailing bytes instead of silently discarding them; the node never writes such values, so only hand-edited or corrupt values are affected.
