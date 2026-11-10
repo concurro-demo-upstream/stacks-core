@@ -19,8 +19,7 @@ use std::fmt::Write;
 use std::{fmt, mem};
 
 use ripemd::Ripemd160;
-use serde::de::{Deserialize, Error as de_Error};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512, Sha512_256};
 use sha3::Keccak256;
 
@@ -41,77 +40,21 @@ pub trait MerkleHashFunc {
     fn bits(&self) -> &[u8];
 }
 
-macro_rules! impl_serde_json_hex_string {
-    ($name:ident, $len:expr) => {
-        pub struct $name {}
-        impl $name {
-            pub fn json_serialize<S: serde::Serializer>(
-                inst: &[u8; $len],
-                s: S,
-            ) -> Result<S::Ok, S::Error> {
-                let hex_inst = to_hex(inst);
-                s.serialize_str(&hex_inst.as_str())
-            }
-
-            pub fn json_deserialize<'de, D: serde::Deserializer<'de>>(
-                d: D,
-            ) -> Result<[u8; $len], D::Error> {
-                let hex_inst = String::deserialize(d)?;
-                let inst_bytes = hex_bytes(&hex_inst).map_err(de_Error::custom)?;
-
-                match inst_bytes.len() {
-                    $len => {
-                        let mut byte_slice = [0u8; $len];
-                        byte_slice.copy_from_slice(&inst_bytes);
-                        Ok(byte_slice)
-                    }
-                    _ => Err(de_Error::custom(format!(
-                        "Invalid hex string -- not {} bytes",
-                        $len
-                    ))),
-                }
-            }
-        }
-    };
-}
-
-impl_serde_json_hex_string!(Hash20, 20);
-impl_serde_json_hex_string!(Hash32, 32);
-impl_serde_json_hex_string!(Hash64, 64);
-
 #[derive(Serialize, Deserialize)]
-pub struct Hash160(
-    #[serde(
-        serialize_with = "Hash20::json_serialize",
-        deserialize_with = "Hash20::json_deserialize"
-    )]
-    pub [u8; 20],
-);
+pub struct Hash160(#[serde(with = "crate::util::serde_serializers::hex_array")] pub [u8; 20]);
 impl_array_newtype!(Hash160, u8, 20);
 impl_array_hexstring_fmt!(Hash160);
 impl_byte_array_newtype!(Hash160, u8, 20);
 pub const HASH160_ENCODED_SIZE: u32 = 20;
 
 #[derive(Serialize, Deserialize)]
-pub struct Keccak256Hash(
-    #[serde(
-        serialize_with = "Hash32::json_serialize",
-        deserialize_with = "Hash32::json_deserialize"
-    )]
-    pub [u8; 32],
-);
+pub struct Keccak256Hash(#[serde(with = "crate::util::serde_serializers::hex_array")] pub [u8; 32]);
 impl_array_newtype!(Keccak256Hash, u8, 32);
 impl_array_hexstring_fmt!(Keccak256Hash);
 impl_byte_array_newtype!(Keccak256Hash, u8, 32);
 
 #[derive(Serialize, Deserialize)]
-pub struct Sha256Sum(
-    #[serde(
-        serialize_with = "Hash32::json_serialize",
-        deserialize_with = "Hash32::json_deserialize"
-    )]
-    pub [u8; 32],
-);
+pub struct Sha256Sum(#[serde(with = "crate::util::serde_serializers::hex_array")] pub [u8; 32]);
 impl_array_newtype!(Sha256Sum, u8, 32);
 impl_array_hexstring_fmt!(Sha256Sum);
 impl_byte_array_newtype!(Sha256Sum, u8, 32);
@@ -123,37 +66,21 @@ impl Default for Sha256Sum {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Sha512Sum(
-    #[serde(
-        serialize_with = "Hash64::json_serialize",
-        deserialize_with = "Hash64::json_deserialize"
-    )]
-    pub [u8; 64],
-);
+pub struct Sha512Sum(#[serde(with = "crate::util::serde_serializers::hex_array")] pub [u8; 64]);
 impl_array_newtype!(Sha512Sum, u8, 64);
 impl_array_hexstring_fmt!(Sha512Sum);
 impl_byte_array_newtype!(Sha512Sum, u8, 64);
 
 #[derive(Serialize, Deserialize)]
 pub struct Sha512Trunc256Sum(
-    #[serde(
-        serialize_with = "Hash32::json_serialize",
-        deserialize_with = "Hash32::json_deserialize"
-    )]
-    pub [u8; 32],
+    #[serde(with = "crate::util::serde_serializers::hex_array")] pub [u8; 32],
 );
 impl_array_newtype!(Sha512Trunc256Sum, u8, 32);
 impl_array_hexstring_fmt!(Sha512Trunc256Sum);
 impl_byte_array_newtype!(Sha512Trunc256Sum, u8, 32);
 
 #[derive(Serialize, Deserialize)]
-pub struct DoubleSha256(
-    #[serde(
-        serialize_with = "Hash32::json_serialize",
-        deserialize_with = "Hash32::json_deserialize"
-    )]
-    pub [u8; 32],
-);
+pub struct DoubleSha256(#[serde(with = "crate::util::serde_serializers::hex_array")] pub [u8; 32]);
 impl_array_newtype!(DoubleSha256, u8, 32);
 impl_array_hexstring_fmt!(DoubleSha256);
 impl_byte_array_newtype!(DoubleSha256, u8, 32);
@@ -659,7 +586,7 @@ pub fn to_bin(s: &[u8]) -> String {
     r
 }
 
-/// Convert a vec of u8 to a hex string
+/// Alias of [`to_hex`], producing lowercase hex without a prefix.
 pub fn bytes_to_hex(s: &[u8]) -> String {
     to_hex(s)
 }
@@ -667,6 +594,39 @@ pub fn bytes_to_hex(s: &[u8]) -> String {
 #[cfg(test)]
 mod test {
     use super::{bin_bytes, hex_bytes, to_bin, DoubleSha256, MerkleHashFunc, MerkleTree};
+
+    #[test]
+    fn hex_characterization_decode_order() {
+        use super::{Hash160, Sha256Sum};
+        use crate::util::{HexDeser, HexError};
+
+        // Newtypes decode first; arrays reject the byte length before decoding.
+        for (input, expected) in [
+            ("a", HexError::BadLength(1)),
+            ("abcd", HexError::BadLength(4)),
+            ("zz", HexError::BadCharacter('z')),
+            ("é0", HexError::BadCharacter('é')),
+        ] {
+            assert_eq!(Hash160::from_hex(input).unwrap_err(), expected);
+            assert_eq!(Sha256Sum::from_hex(input).unwrap_err(), expected);
+            assert_eq!(
+                <[u8; 20]>::try_from_hex(input),
+                Err(HexError::BadLength(input.len()))
+            );
+            assert_eq!(
+                <[u8; 32]>::try_from_hex(input),
+                Err(HexError::BadLength(input.len()))
+            );
+        }
+        let mixed = "aB".repeat(20);
+        let hash = Hash160::from_hex(&mixed).unwrap();
+        assert_eq!(hash.0, [0xab; 20]);
+        assert_eq!(<[u8; 20]>::try_from_hex(&mixed).unwrap(), hash.0);
+        assert_eq!(format!("{hash:?}"), "ab".repeat(20));
+        let mixed = "aB".repeat(32);
+        assert_eq!(Sha256Sum::from_hex(&mixed).unwrap().0, [0xab; 32]);
+        assert_eq!(<[u8; 32]>::try_from_hex(&mixed).unwrap(), [0xab; 32]);
+    }
 
     struct MerkleTreeFixture {
         data: Vec<Vec<u8>>,

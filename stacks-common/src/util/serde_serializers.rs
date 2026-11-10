@@ -1,6 +1,61 @@
+/// Serde adapter for fixed-size byte arrays as lowercase hex without a prefix.
+pub mod hex_array {
+    /// Serialize an array as lowercase hex without a prefix.
+    pub fn serialize<S: serde::Serializer, const N: usize>(
+        val: &[u8; N],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&crate::util::hash::to_hex(val))
+    }
+
+    /// Decode hex first, preserving hex errors before the custom size error.
+    pub fn deserialize<'de, D: serde::Deserializer<'de>, const N: usize>(
+        d: D,
+    ) -> Result<[u8; N], D::Error> {
+        let hex: String = serde::Deserialize::deserialize(d)?;
+        let bytes = crate::util::hash::hex_bytes(&hex).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom(format!("Invalid hex string -- not {N} bytes")))
+    }
+}
+
+/// Skip any two-byte prefix, retaining legacy acceptance and UTF-8 boundary errors.
+fn skip_two_char_prefix<E: serde::de::Error>(s: &str) -> Result<&str, E> {
+    s.get(2..)
+        .ok_or_else(|| E::invalid_length(s.len(), &"at least length 2 string"))
+}
+
+/// Check prefix length and UTF-8 boundary first, then require the literal `0x`.
+fn strip_0x_prefix<E: serde::de::Error>(s: &str) -> Result<&str, E> {
+    let hex = skip_two_char_prefix(s)?;
+    if s.get(0..2) != Some("0x") {
+        return Err(E::custom("must supply 0x-prefix"));
+    }
+    Ok(hex)
+}
+
+/// Serialize consensus bytes as lowercase hex with a `0x` prefix.
+fn codec_to_prefixed_hex<T: crate::codec::StacksMessageCodec, E: serde::ser::Error>(
+    val: &T,
+) -> Result<String, E> {
+    let mut bytes = vec![];
+    val.consensus_serialize(&mut bytes).map_err(E::custom)?;
+    Ok(crate::util::hash::to_hex_prefixed(&bytes, true))
+}
+
+/// Decode hex consensus bytes, preserving the codec's trailing-byte behavior.
+fn codec_from_hex<T: crate::codec::StacksMessageCodec, E: serde::de::Error>(
+    hex: &str,
+) -> Result<T, E> {
+    let bytes = crate::util::hash::hex_bytes(hex).map_err(E::custom)?;
+    T::consensus_deserialize(&mut &bytes[..]).map_err(E::custom)
+}
+
 /// This module serde encodes and decodes optional byte fields in RPC
 /// responses as Some(String) where the String is a `0x` prefixed
 /// hex string.
+/// Deserialization accepts any two-byte prefix for legacy compatibility.
 pub mod prefix_opt_hex {
     pub fn serialize<S: serde::Serializer, T: std::fmt::LowerHex>(
         val: &Option<T>,
@@ -22,12 +77,7 @@ pub mod prefix_opt_hex {
         let Some(inst_str) = opt_inst_str else {
             return Ok(None);
         };
-        let Some(hex_str) = inst_str.get(2..) else {
-            return Err(serde::de::Error::invalid_length(
-                inst_str.len(),
-                &"at least length 2 string",
-            ));
-        };
+        let hex_str = super::skip_two_char_prefix::<D::Error>(&inst_str)?;
         let val = T::try_from_hex(hex_str).map_err(serde::de::Error::custom)?;
         Ok(Some(val))
     }
@@ -36,6 +86,7 @@ pub mod prefix_opt_hex {
 /// This module serde encodes and decodes implementations of
 /// `HexSer` and `HexDeser` in RPC responses as a String where the
 /// String is a `0x` prefixed hex string.
+/// Deserialization requires the literal `0x` prefix.
 pub mod prefix_hex {
     pub fn serialize<S: serde::Serializer, T: crate::util::HexSer>(
         val: &T,
@@ -49,56 +100,39 @@ pub mod prefix_hex {
         d: D,
     ) -> Result<T, D::Error> {
         let inst_str: String = serde::Deserialize::deserialize(d)?;
-        let Some(hex_str) = inst_str.get(2..) else {
-            return Err(serde::de::Error::invalid_length(
-                inst_str.len(),
-                &"at least length 2 string",
-            ));
-        };
-        if inst_str.get(0..2) != Some("0x") {
-            return Err(serde::de::Error::custom("must supply 0x-prefix"));
-        }
+        let hex_str = super::strip_0x_prefix::<D::Error>(&inst_str)?;
         T::try_from_hex(hex_str).map_err(serde::de::Error::custom)
     }
 }
 
 /// This module serde encode and decodes structs that
 /// implement StacksMessageCodec as a 0x-prefixed hex string.
+/// Deserialization accepts any two-byte prefix for legacy compatibility.
 pub mod prefix_hex_codec {
     use crate::codec::StacksMessageCodec;
-    use crate::util::hash::{hex_bytes, to_hex};
 
     pub fn serialize<S: serde::Serializer, T: StacksMessageCodec>(
         val: &T,
         s: S,
     ) -> Result<S::Ok, S::Error> {
-        let mut bytes = vec![];
-        val.consensus_serialize(&mut bytes)
-            .map_err(serde::ser::Error::custom)?;
-        s.serialize_str(&format!("0x{}", to_hex(&bytes)))
+        s.serialize_str(&super::codec_to_prefixed_hex::<_, S::Error>(val)?)
     }
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>, T: StacksMessageCodec>(
         d: D,
     ) -> Result<T, D::Error> {
         let inst_str: String = serde::Deserialize::deserialize(d)?;
-        let Some(hex_str) = inst_str.get(2..) else {
-            return Err(serde::de::Error::invalid_length(
-                inst_str.len(),
-                &"at least length 2 string",
-            ));
-        };
-        let bytes = hex_bytes(hex_str).map_err(serde::de::Error::custom)?;
-        T::consensus_deserialize(&mut &bytes[..]).map_err(serde::de::Error::custom)
+        let hex_str = super::skip_two_char_prefix::<D::Error>(&inst_str)?;
+        super::codec_from_hex(hex_str)
     }
 }
 
 /// This module serde encode and decodes structs that
 /// implement StacksMessageCodec as a 0x-prefixed hex string.
 /// This is the same as prefix_hex_codec, but for Option<T>.
+/// Deserialization accepts any two-byte prefix for legacy compatibility.
 pub mod prefix_opt_hex_codec {
     use crate::codec::StacksMessageCodec;
-    use crate::util::hash::{hex_bytes, to_hex};
 
     pub fn serialize<S: serde::Serializer, T: StacksMessageCodec>(
         val: &Option<T>,
@@ -106,11 +140,7 @@ pub mod prefix_opt_hex_codec {
     ) -> Result<S::Ok, S::Error> {
         match val {
             Some(ref some_val) => {
-                let mut bytes = vec![];
-                some_val
-                    .consensus_serialize(&mut bytes)
-                    .map_err(serde::ser::Error::custom)?;
-                let hex_string = format!("0x{}", to_hex(&bytes));
+                let hex_string = super::codec_to_prefixed_hex::<_, S::Error>(some_val)?;
                 s.serialize_some(&hex_string)
             }
             None => s.serialize_none(),
@@ -124,19 +154,14 @@ pub mod prefix_opt_hex_codec {
         let Some(inst_string) = opt_inst_str else {
             return Ok(None);
         };
-        let Some(hex_str) = inst_string.get(2..) else {
-            return Err(serde::de::Error::invalid_length(
-                inst_string.len(),
-                &"at least length 2 string",
-            ));
-        };
-        let bytes = hex_bytes(hex_str).map_err(serde::de::Error::custom)?;
-        let val = T::consensus_deserialize(&mut &bytes[..]).map_err(serde::de::Error::custom)?;
+        let hex_str = super::skip_two_char_prefix::<D::Error>(&inst_string)?;
+        let val = super::codec_from_hex(hex_str)?;
         Ok(Some(val))
     }
 }
 
 /// Serialize strings as 0x-prefixed strings.
+/// Deserialization accepts any two-byte prefix for legacy compatibility.
 pub mod prefix_string_0x {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -146,18 +171,88 @@ pub mod prefix_string_0x {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         let s: String = Deserialize::deserialize(d)?;
-        let Some(hex_str) = s.get(2..) else {
-            return Err(serde::de::Error::invalid_length(
-                s.len(),
-                &"at least length 2 string",
-            ));
-        };
+        let hex_str = super::skip_two_char_prefix::<D::Error>(&s)?;
         Ok(hex_str.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hex_characterization_json() {
+        use crate::util::hash::{DoubleSha256, Hash160, Sha256Sum};
+        fn check<T: serde::Serialize + serde::de::DeserializeOwned>(n: usize) {
+            let json = format!("\"{}\"", "aB".repeat(n));
+            let value: T = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{}\"", "ab".repeat(n))
+            );
+            for (input, expected) in [
+                ("abcd", format!("Invalid hex string -- not {n} bytes")),
+                ("zz", "bad character z for hex string".into()),
+                ("a", "bad length 1 for hex string".into()),
+                ("é0", "bad character é for hex string".into()),
+            ] {
+                let err = serde_json::from_str::<T>(&serde_json::to_string(input).unwrap())
+                    .err()
+                    .unwrap();
+                assert_eq!(err.to_string(), expected);
+            }
+        }
+        check::<Hash160>(20);
+        check::<Sha256Sum>(32);
+        check::<DoubleSha256>(32);
+    }
+
+    #[test]
+    fn hex_characterization_prefixes() {
+        // The legacy adapters skip two bytes without requiring an actual 0x prefix.
+        for input in ["zzab", "0xab", "éab"] {
+            let json = serde_json::to_string(input).unwrap();
+            let mut d = serde_json::Deserializer::from_str(&json);
+            let prefixed = format!("{}{}", &input[..2], "ab".repeat(20));
+            let opt_json = serde_json::to_string(&prefixed).unwrap();
+            let mut opt_d = serde_json::Deserializer::from_str(&opt_json);
+            let value: Option<crate::util::hash::Hash160> =
+                super::prefix_opt_hex::deserialize(&mut opt_d).unwrap();
+            assert_eq!(value.unwrap().0, [0xab; 20]);
+            assert_eq!(
+                super::prefix_hex_codec::deserialize::<_, u8>(&mut d).unwrap(),
+                0xab
+            );
+            let mut d = serde_json::Deserializer::from_str(&json);
+            assert_eq!(
+                super::prefix_opt_hex_codec::deserialize::<_, u8>(&mut d).unwrap(),
+                Some(0xab)
+            );
+            let mut d = serde_json::Deserializer::from_str(&json);
+            assert_eq!(super::prefix_string_0x::deserialize(&mut d).unwrap(), "ab");
+        }
+        for input in ["", "0", "aé"] {
+            let json = serde_json::to_string(input).unwrap();
+            macro_rules! short {
+                ($module:ident, $ty:ty) => {
+                    let mut d = serde_json::Deserializer::from_str(&json);
+                    let result: Result<$ty, _> = super::$module::deserialize(&mut d);
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("at least length 2 string"));
+                };
+            }
+            short!(prefix_opt_hex, Option<crate::util::hash::Hash160>);
+            short!(prefix_hex_codec, u8);
+            short!(prefix_opt_hex_codec, Option<u8>);
+            short!(prefix_string_0x, String);
+            short!(prefix_hex, [u8; 1]);
+        }
+        assert!(deser_helper::<1>("zzab")
+            .unwrap_err()
+            .to_string()
+            .contains("must supply 0x-prefix"));
+    }
+
     fn ser_helper<const N: usize>(bytes: &[u8; N]) -> Result<String, serde_json::Error> {
         let mut ser = serde_json::Serializer::new(vec![]);
         super::prefix_hex::serialize(bytes, &mut ser)?;
