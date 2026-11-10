@@ -1,0 +1,1 @@
+`RetryReader` no longer loses buffered bytes when the underlying reader fails after a partial read, and `RetryReader`/`BoundReader` no longer touch the underlying source for empty reads or reads at the size limit.
