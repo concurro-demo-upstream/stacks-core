@@ -52,6 +52,112 @@ use crate::net::tests::inv::nakamoto::make_nakamoto_peer_from_invs;
 use crate::net::tests::{NakamotoBootPlan, NakamotoBootStep, NakamotoBootTenure};
 use crate::util_lib::strings::StacksString;
 
+/// Verify that `set_block_hash()` on an ephemeral MARF store moves disk-backed reads to the
+/// requested ancestor of the base tip, and that the previous tip can be restored afterwards.
+/// * Reads at a non-base-tip ancestor see only the keys written up to that ancestor, and neither
+///   later disk keys nor ephemeral keys.
+/// * Restoring the old tip (as `at-block` does on return) works from a disk tip back to the
+///   ephemeral tip, and from a disk ancestor back to the disk base tip.
+/// * Seeking to an unknown block fails and leaves the open tip unchanged.
+#[test]
+fn test_ephemeral_marf_store_set_block_hash_disk_ancestor() {
+    let path = format!("/tmp/{}.marf", function_name!());
+    if fs::metadata(&path).is_ok() {
+        fs::remove_dir_all(&path).unwrap();
+    }
+
+    let mut marfed_kv = MarfedKV::open(
+        &path,
+        None,
+        Some(MARFOpenOpts::new(TrieHashCalculationMode::Deferred, false)),
+    )
+    .unwrap();
+
+    // write 10 disk-backed blocks, each with 10 keys of its own
+    let mut blocks = vec![StacksBlockId::sentinel()];
+    let mut block_data = vec![vec![]];
+    for blk in 0..10 {
+        let final_block_id = StacksBlockId([blk as u8; 32]);
+        let target_block_id = StacksBlockId([0xf0; 32]);
+        let keys_and_values: Vec<_> = (0..10)
+            .map(|k| {
+                (
+                    format!("key-{}", blk * 10 + k),
+                    format!("value-{}", blk * 10 + k),
+                )
+            })
+            .collect();
+        let mut marf = marfed_kv.begin(blocks.last().as_ref().unwrap(), &target_block_id);
+        marf.put_all_data(keys_and_values.clone()).unwrap();
+        marf.commit_to_processed_block(&final_block_id).unwrap();
+
+        blocks.push(final_block_id);
+        block_data.push(keys_and_values);
+    }
+
+    // `blocks[0]` is the sentinel, so `blocks[i]` is the block at index `i` and holds `block_data[i]`
+    let base_tip = blocks[10].clone();
+    let ancestor = blocks[5].clone();
+    let ephemeral_tip = StacksBlockId([0xf0; 32]);
+    let ephemeral_kvs = vec![("ephemeral-key".to_string(), "ephemeral-value".to_string())];
+
+    let mut store = marfed_kv
+        .begin_ephemeral(&base_tip, &ephemeral_tip)
+        .unwrap();
+    store.put_all_data(ephemeral_kvs.clone()).unwrap();
+    let ephemeral_height = store.get_current_block_height();
+
+    // reads at the base tip see all disk keys plus the ephemeral keys
+    let assert_open_at_ephemeral_tip = |store: &mut dyn ClarityBackingStore| {
+        assert_eq!(store.get_current_block_height(), ephemeral_height);
+        for (key, value) in ephemeral_kvs.iter() {
+            assert_eq!(store.get_data(key).unwrap().as_ref(), Some(value));
+        }
+        for (key, value) in block_data.iter().flatten() {
+            assert_eq!(store.get_data(key).unwrap().as_ref(), Some(value));
+        }
+    };
+    assert_open_at_ephemeral_tip(&mut store);
+
+    // (a) seek ephemeral -> non-base-tip disk ancestor
+    let old_tip = store.set_block_hash(ancestor.clone()).unwrap();
+    assert_eq!(old_tip, ephemeral_tip);
+    // blocks[5] is at disk height 4 (blocks[1] is height 0)
+    assert_eq!(store.get_current_block_height(), 4);
+    for (i, keys_and_values) in block_data.iter().enumerate() {
+        for (key, value) in keys_and_values.iter() {
+            let expected = (i <= 5).then_some(value);
+            assert_eq!(store.get_data(key).unwrap().as_ref(), expected);
+        }
+    }
+    for (key, _) in ephemeral_kvs.iter() {
+        assert!(store.get_data(key).unwrap().is_none());
+    }
+
+    // (b) an unknown block is rejected, and the ancestor stays open
+    assert!(store.set_block_hash(StacksBlockId([0xaa; 32])).is_err());
+    assert_eq!(store.get_current_block_height(), 4);
+    assert!(store.get_data("key-99").unwrap().is_none());
+    assert!(store.get_data("key-49").unwrap().is_some());
+
+    // (c) restore disk ancestor -> ephemeral tip
+    let old_tip = store.set_block_hash(old_tip).unwrap();
+    assert_eq!(old_tip, ancestor);
+    assert_open_at_ephemeral_tip(&mut store);
+
+    // (d) seek ephemeral -> ancestor -> disk base tip.  The last step is disk -> disk.
+    store.set_block_hash(ancestor.clone()).unwrap();
+    let old_tip = store.set_block_hash(base_tip.clone()).unwrap();
+    assert_eq!(old_tip, ancestor);
+    assert_eq!(store.get_current_block_height(), 9);
+    for (key, value) in block_data.iter().flatten() {
+        assert_eq!(store.get_data(key).unwrap().as_ref(), Some(value));
+    }
+    for (key, _) in ephemeral_kvs.iter() {
+        assert!(store.get_data(key).unwrap().is_none());
+    }
+}
+
 /// Verify that an ephemeral MARF can be created off of an already-written block of an on-disk
 /// MARF.
 /// * Verify that keys inserted into the ephemeral MARF land in the RAM-backed MARF
@@ -442,7 +548,12 @@ fn test_ephemeral_nakamoto_block_replay_simple() {
     }
 }
 
-/// Test block replay with contract-calls which exercise the clarity DB
+/// Test block replay with contract-calls which exercise the clarity DB.
+///
+/// `test-at-ancestor` calls `at-block` on the block three heights back.  Unlike the
+/// parent block, this ancestor is not the base tip of the ephemeral MARF, so replay only matches
+/// the canonical receipts (including print events) if disk-backed reads inside `at-block` resolve
+/// at the requested ancestor.
 #[test]
 fn test_ephemeral_nakamoto_block_replay_smart_contract() {
     let test_name = function_name!();
@@ -622,11 +733,23 @@ fn test_ephemeral_nakamoto_block_replay_smart_contract() {
             (at-block prev-block (test-readonly-clarity-db-funcs))
         true)))
 
+(define-private (test-at-ancestor)
+    (let (
+        (ancestor-opt (if (>= (- stacks-block-height u3) (var-get start-height)) (get-stacks-block-info? id-header-hash (- stacks-block-height u3)) none))
+    )
+    (match ancestor-opt
+        ancestor
+            ;; print outside of `at-block`, since print events from read-only code are not
+            ;; reported in the receipts that replay compares
+            (print (at-block ancestor { test-var: (var-get test-var), height: stacks-block-height }))
+        { test-var: u0, height: u0 })))
+
 (define-public (test-all)
     (begin
         (test-readonly-clarity-db-funcs)
         (test-clarity-db-funcs)
         (test-readonly-clarity-db-funcs-at-prev-block)
+        (test-at-ancestor)
         (ok true)))
 "#;
 

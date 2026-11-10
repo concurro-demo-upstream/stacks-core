@@ -21,11 +21,11 @@ use clarity::vm::database::sqlite::{
     sqlite_insert_metadata,
 };
 use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
-use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
+use clarity::vm::errors::{VmExecutionError, VmInternalError};
 use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::{self, Connection};
 use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_marf::marf::{MarfConnection, MarfTransaction, MARF};
 use stacks_marf::{Error, MARFValue};
@@ -378,25 +378,11 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             return Ok(old_tip);
         }
 
-        // this bhh is not ephemeral, so it might be disk-backed.
-        self.read_only_marf
-            .check_ancestor_block_hash(&bhh)
-            .map_err(|e| match e {
-                Error::NotFoundError => {
-                    test_debug!("No such block {:?} (NotFoundError)", &bhh);
-                    RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(bhh.0))
-                }
-                Error::NonMatchingForks(_bh1, _bh2) => {
-                    test_debug!(
-                        "No such block {:?} (NonMatchingForks({}, {}))",
-                        &bhh,
-                        BlockHeaderHash(_bh1),
-                        BlockHeaderHash(_bh2)
-                    );
-                    RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(bhh.0))
-                }
-                _ => panic!("ERROR: Unexpected MARF failure: {}", e),
-            })?;
+        // this bhh is not ephemeral, so it might be disk-backed.  The read-only MARF must be
+        // indexed off of `bhh` so that disk-backed reads and height queries resolve at the
+        // requested ancestor instead of the previously opened disk tip.  This also checks that
+        // `bhh` is a known ancestor, leaving both tips unchanged on error.
+        self.read_only_marf.set_block_hash(bhh.clone())?;
 
         let old_tip = mem::replace(&mut self.open_tip, EphemeralTip::Disk(bhh));
         Ok(old_tip.into_block_id())
