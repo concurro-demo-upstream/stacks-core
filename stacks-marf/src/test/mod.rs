@@ -374,6 +374,61 @@ pub fn make_test_insert_data(
     ret
 }
 
+/// Per-thread allocation counting for manual performance tests (see `marf_perfs`).
+///
+/// Installed as the global allocator of the `stacks-marf` unit-test binary. Counters are
+/// thread-local, so a measurement is exact even while other tests run on other threads.
+pub mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// (allocation calls, bytes requested) made by the current thread so far.
+        static COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    fn record(bytes: usize) {
+        let _ = COUNTS.try_with(|c| {
+            let (n, b) = c.get();
+            c.set((n + 1, b + bytes as u64));
+        });
+    }
+
+    /// Returns `(allocation calls, bytes requested)` made by the current thread so far.
+    pub fn thread_counts() -> (u64, u64) {
+        COUNTS.try_with(Cell::get).unwrap_or((0, 0))
+    }
+
+    /// A `GlobalAlloc` that forwards to `System` and counts allocations per thread.
+    struct CountingAllocator;
+
+    // SAFETY: every method forwards its arguments unchanged to `System`, which upholds the
+    // `GlobalAlloc` contract. The counter update neither allocates nor touches the memory.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+}
+
 pub mod opts {
     use std::sync::LazyLock;
 
@@ -392,6 +447,8 @@ pub mod opts {
         LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Deferred, false));
     pub static OPTS_DEF_EXT: LazyLock<MARFOpenOpts> =
         LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Deferred, true));
+    pub static OPTS_ALL_EXT: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::All, true));
     pub static OPTS_DEF_COMP: LazyLock<MARFOpenOpts> =
         LazyLock::new(|| OPTS_DEF.clone().with_compression(true));
     pub static OPTS_DEF_EXT_COMP: LazyLock<MARFOpenOpts> =

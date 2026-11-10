@@ -203,6 +203,8 @@ mod utils {
 #[case::deferred_batch_64(&opts::OPTS_DEF_EXT, 64)]
 #[case::deferred_batch_67(&opts::OPTS_DEF_EXT, 67)]
 #[case::deferred_batch_128(&opts::OPTS_DEF_EXT, 128)]
+#[case::all_batch_0(&opts::OPTS_ALL_EXT, 0)]
+#[case::all_batch_67(&opts::OPTS_ALL_EXT, 67)]
 fn test_marf_128_128(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size: usize) {
     let test_data = make_test_insert_data(128, 128);
     let root_hash =

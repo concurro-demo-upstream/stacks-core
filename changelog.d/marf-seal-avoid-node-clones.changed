@@ -1,0 +1,1 @@
+Sealing a MARF trie no longer clones each node while computing deferred node hashes, which reduces allocations when committing blocks with large write sets; state roots, proofs and storage are unchanged.

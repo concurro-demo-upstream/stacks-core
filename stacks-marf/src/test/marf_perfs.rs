@@ -16,6 +16,7 @@
 //! MARF performance tests intended to be run manually for analysis.
 
 use std::fs;
+use std::time::{Duration, Instant};
 
 use stacks_common::types::chainstate::{BlockHeaderHash, TrieHash};
 use stacks_common::util::get_epoch_time_ms;
@@ -23,7 +24,8 @@ use stacks_common::util::hash::to_hex;
 
 use crate::marf::{MARFOpenOpts, MarfConnection, MARF};
 use crate::storage::TrieFileStorage;
-use crate::test::{merkle_test_marf, opts};
+use crate::test::alloc_counter::thread_counts;
+use crate::test::{make_test_insert_data, merkle_test_marf, opts};
 use crate::{ClarityMarfTrieId, MARFValue, TrieLeaf};
 
 // insert a random sequence of 1024 * 1024 keys.  Every 4096 inserts, fork.
@@ -242,5 +244,70 @@ fn marf_read_random_1048576_4096_file_storage() {
                 start_time = get_epoch_time_ms();
             }
         }
+    }
+}
+
+/// Measures the cost of sealing large MARF updates (`TrieRAM::calculate_node_hashes`) in
+/// `Deferred` mode on an in-memory MARF.
+///
+/// Each workload writes `blocks` blocks of `keys_per_block` keys; the last `measured` blocks
+/// are timed. For those blocks, the seal is timed and its allocations (calls and bytes
+/// requested by this thread) are counted, and `commit()` is then timed separately, to show
+/// that cost has not merely moved to the dump or flush step. The final root hash is printed
+/// so runs on different implementations can be compared.
+///
+/// Run with:
+/// `cargo test -p stacks-marf --release --lib marf_seal_large_write_set -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn marf_seal_large_write_set() {
+    for (keys_per_block, blocks, measured) in [(16_384u64, 12u64, 8usize), (2_048, 48, 16)] {
+        let data = make_test_insert_data(keys_per_block, blocks);
+        let mut m = MARF::from_path(":memory:", opts::OPTS_DEF_EXT.clone()).unwrap();
+        let mut last = BlockHeaderHash::sentinel();
+
+        let (mut seal_time, mut commit_time) = (Duration::ZERO, Duration::ZERO);
+        let (mut seal_allocs, mut seal_bytes) = (0u64, 0u64);
+        let mut root_hash = TrieHash::EMPTY;
+
+        for (i, block_data) in data.iter().enumerate() {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let header = BlockHeaderHash(bytes);
+
+            let keys: Vec<_> = block_data.iter().map(|(k, _)| k.clone()).collect();
+            let values = block_data.iter().map(|(_, v)| v.clone()).collect();
+
+            m.begin(&last, &header).unwrap();
+            m.insert_batch(&keys, values).unwrap();
+
+            let measure = i + measured >= data.len();
+            let (allocs_before, bytes_before) = thread_counts();
+            let seal_start = Instant::now();
+            root_hash = m.seal().unwrap();
+            let seal_elapsed = seal_start.elapsed();
+            let (allocs_after, bytes_after) = thread_counts();
+
+            let commit_start = Instant::now();
+            m.commit().unwrap();
+            let commit_elapsed = commit_start.elapsed();
+
+            if measure {
+                seal_time += seal_elapsed;
+                commit_time += commit_elapsed;
+                seal_allocs += allocs_after - allocs_before;
+                seal_bytes += bytes_after - bytes_before;
+            }
+            last = header;
+        }
+
+        eprintln!(
+            "seal workload {keys_per_block} keys x {blocks} blocks (last {measured} measured): \
+             seal = {} ms, seal allocations = {seal_allocs}, seal bytes = {seal_bytes}, \
+             commit = {} ms, final root = {}",
+            seal_time.as_millis(),
+            commit_time.as_millis(),
+            root_hash.to_hex()
+        );
     }
 }

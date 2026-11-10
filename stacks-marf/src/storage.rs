@@ -666,73 +666,94 @@ impl<T: MarfTrieId> TrieRAM<T> {
     /// If the given `storage_tx`'s hash calculation mode is set to
     /// `TrieHashCalculationMode::Deferred`, then this method will also store each non-leaf node's
     /// hash.
+    ///
+    /// The node is borrowed rather than cloned.  Since recursing and `write_node_hash` need
+    /// `&mut self`, each of the node's pointers is re-read by index just before it is used.
+    /// This is sound because recursion only overwrites node hashes, never pointers or the
+    /// number of pointers in a node.
+    ///
+    /// The hash input of a non-leaf node is consensus-critical: its consensus bytes, followed by
+    /// one hash per pointer, in pointer order -- the empty hash for an empty pointer, the child's
+    /// hash for an inline child, or the hash of the back-block for a back-pointer.
     fn calculate_node_hashes(
         &mut self,
         storage_tx: &mut TrieStorageTransaction<T>,
         node_ptr: u32, // in-memory index is always a u32
     ) -> Result<TrieHash, Error> {
-        let (node, node_hash) = self.get_nodetype(node_ptr)?.to_owned();
+        let (node, node_hash) = self.get_nodetype(node_ptr)?;
         if node.is_leaf() {
             // base case: we already have the hash of the leaf, so return it.
-            Ok(node_hash)
-        } else {
-            // inductive case: calculate children hashes, hash them, and return that hash.
-            let mut hasher = TrieHasher::new();
-            let empty_node_hash = TrieHash::EMPTY;
-
-            node.write_consensus_bytes(storage_tx, &mut hasher)
-                .expect("IO Failure pushing to hasher.");
-
-            // calculate the hashes of this node's children, and store them if they're in the
-            // same trie.
-            for ptr in node.ptrs().iter() {
-                if ptr.is_empty() {
-                    // hash of empty string
-                    hasher.write_all(empty_node_hash.as_bytes())?;
-                } else if !is_backptr(ptr.id()) {
-                    let child_idx = ptr.try_ptr_into_u32()?;
-                    // hash is the hash of this node's children
-                    let node_hash = self.calculate_node_hashes(storage_tx, child_idx)?;
-
-                    trace!(
-                        "calculate_node_hashes({:?}): at chr {} ptr {}: {:?} {:?}",
-                        &self.block_header,
-                        ptr.chr(),
-                        ptr.ptr(),
-                        &node_hash,
-                        node
-                    );
-                    hasher.write_all(node_hash.as_bytes())?;
-
-                    if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
-                        && ptr.id() != TrieNodeID::Leaf as u8
-                    {
-                        // need to store this hash too, since we deferred calculation
-                        self.write_node_hash(child_idx, node_hash)?;
-                    }
-                } else {
-                    // hash is that of the block that contains this node
-                    let block_hash = storage_tx.get_block_hash_caching(ptr.back_block())?;
-                    trace!(
-                        "calculate_node_hashes({:?}): at chr {} bkptr {}: {:?} {:?}",
-                        &self.block_header,
-                        ptr.chr(),
-                        ptr.ptr(),
-                        &block_hash,
-                        node
-                    );
-                    hasher.write_all(block_hash.as_bytes())?;
-                }
-            }
-
-            let node_hash = {
-                let mut buf = [0u8; 32];
-                buf.copy_from_slice(hasher.finalize().as_slice());
-                TrieHash(buf)
-            };
-
-            Ok(node_hash)
+            return Ok(*node_hash);
         }
+
+        // inductive case: calculate children hashes, hash them, and return that hash.
+        let mut hasher = TrieHasher::new();
+        let empty_node_hash = TrieHash::EMPTY;
+
+        node.write_consensus_bytes(storage_tx, &mut hasher)
+            .expect("IO Failure pushing to hasher.");
+        let num_ptrs = node.ptrs().len();
+
+        // calculate the hashes of this node's children, and store them if they're in the
+        // same trie.
+        for i in 0..num_ptrs {
+            let ptr = *self
+                .get_nodetype(node_ptr)?
+                .0
+                .ptrs()
+                .get(i)
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "Node at {node_ptr} has no pointer at index {i} while calculating hashes"
+                    ))
+                })?;
+
+            if ptr.is_empty() {
+                // hash of empty string
+                hasher.write_all(empty_node_hash.as_bytes())?;
+            } else if !is_backptr(ptr.id()) {
+                let child_idx = ptr.try_ptr_into_u32()?;
+                // hash is the hash of this node's children
+                let node_hash = self.calculate_node_hashes(storage_tx, child_idx)?;
+
+                trace!(
+                    "calculate_node_hashes({:?}): at chr {} ptr {}: {:?} in node {}",
+                    &self.block_header,
+                    ptr.chr(),
+                    ptr.ptr(),
+                    &node_hash,
+                    node_ptr
+                );
+                hasher.write_all(node_hash.as_bytes())?;
+
+                if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
+                    && ptr.id() != TrieNodeID::Leaf as u8
+                {
+                    // need to store this hash too, since we deferred calculation
+                    self.write_node_hash(child_idx, node_hash)?;
+                }
+            } else {
+                // hash is that of the block that contains this node
+                let block_hash = storage_tx.get_block_hash_caching(ptr.back_block())?;
+                trace!(
+                    "calculate_node_hashes({:?}): at chr {} bkptr {}: {:?} in node {}",
+                    &self.block_header,
+                    ptr.chr(),
+                    ptr.ptr(),
+                    &block_hash,
+                    node_ptr
+                );
+                hasher.write_all(block_hash.as_bytes())?;
+            }
+        }
+
+        let node_hash = {
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(hasher.finalize().as_slice());
+            TrieHash(buf)
+        };
+
+        Ok(node_hash)
     }
 
     /// Walk through the buffered TrieNodes and dump them to f.
