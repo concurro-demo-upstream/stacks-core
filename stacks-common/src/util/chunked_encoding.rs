@@ -321,10 +321,16 @@ impl<R: Read> Read for HttpChunkedTransferReader<'_, R> {
     }
 }
 
+/// Persistent buffering and completion state for a chunked HTTP response.
 pub struct HttpChunkedTransferWriterState {
+    /// Maximum payload size of each chunk.
     chunk_size: usize,
+    /// Payload waiting to be emitted as a chunk.
     chunk_buf: Vec<u8>,
+    /// Response is complete; no further framing is sent.
     corked: bool,
+    /// An underlying write failed; a partial frame makes continuation unsafe.
+    failed: bool,
 }
 
 impl HttpChunkedTransferWriterState {
@@ -333,6 +339,7 @@ impl HttpChunkedTransferWriterState {
             chunk_size,
             chunk_buf: vec![],
             corked: false,
+            failed: false,
         }
     }
 
@@ -367,12 +374,26 @@ impl<'a, 'state, W: Write> HttpChunkedTransferWriter<'a, 'state, W> {
         Ok(to_send)
     }
 
+    /// Reject continuation after an underlying write may have left a partial frame.
+    fn check_failed(&self) -> io::Result<()> {
+        if self.state.failed {
+            Err(io::Error::other(
+                "chunked transfer writer failed earlier; response is incomplete",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn flush_chunk(&mut self) -> io::Result<usize> {
         let sent = HttpChunkedTransferWriter::send_chunk(
             &mut self.fd,
             self.state.chunk_size,
             &self.state.chunk_buf,
-        )?;
+        )
+        .inspect_err(|_| {
+            self.state.failed = true;
+        })?;
         self.state.chunk_buf.clear();
         Ok(sent)
     }
@@ -388,20 +409,36 @@ impl<'a, 'state, W: Write> HttpChunkedTransferWriter<'a, 'state, W> {
         to_copy
     }
 
+    /// Mark complete without sending a terminator. Use only when the terminator
+    /// was already sent or must be suppressed.
     pub fn cork(&mut self) {
-        // block future flushes from sending trailing empty chunks -- we're done sending
         self.state.corked = true;
     }
 
+    /// Whether the response has been marked complete.
     pub fn corked(&self) -> bool {
         self.state.corked
     }
 }
 
+/// Flushing completes the response exactly once; empty writes always succeed.
+///
+/// # Errors
+/// Non-empty writes after completion fail. Any underlying write failure makes
+/// subsequent non-empty writes and flushes fail without touching the output.
 impl<W: Write> Write for HttpChunkedTransferWriter<'_, '_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.check_failed()?;
+        if self.state.corked {
+            return Err(io::Error::other(
+                "chunked transfer response already completed",
+            ));
+        }
         let mut written = 0;
-        while written < buf.len() && !self.state.corked {
+        while written < buf.len() {
             if !self.state.chunk_buf.is_empty() {
                 if self.state.chunk_buf.len() < self.state.chunk_size {
                     let nw = self.buf_chunk(&buf[written..]);
@@ -415,7 +452,10 @@ impl<W: Write> Write for HttpChunkedTransferWriter<'_, '_, W> {
                     &mut self.fd,
                     self.state.chunk_size,
                     &buf[written..(written + self.state.chunk_size)],
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.state.failed = true;
+                })?;
                 written += nw;
             } else {
                 let nw = self.buf_chunk(&buf[written..]);
@@ -426,19 +466,18 @@ impl<W: Write> Write for HttpChunkedTransferWriter<'_, '_, W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // send out any buffered chunk data
-        if !self.state.corked {
-            self.flush_chunk().and_then(|nw| {
-                if nw > 0 {
-                    // send empty chunk
-                    self.fd.write_all(b"0\r\n\r\n").map(|_nw| ())
-                } else {
-                    Ok(())
-                }
-            })
-        } else {
-            Ok(())
+        self.check_failed()?;
+        if self.state.corked {
+            return Ok(());
         }
+        if !self.state.chunk_buf.is_empty() {
+            self.flush_chunk()?;
+        }
+        self.fd.write_all(b"0\r\n\r\n").inspect_err(|_| {
+            self.state.failed = true;
+        })?;
+        self.state.corked = true;
+        Ok(())
     }
 }
 
@@ -450,6 +489,123 @@ mod test {
     use rand::RngCore as _;
 
     use super::*;
+
+    /// Records short writes, optionally interrupting once or failing at a byte boundary.
+    struct FaultWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        calls: usize,
+        interrupt: bool,
+    }
+
+    impl Write for FaultWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.interrupt {
+                self.interrupt = false;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.bytes.len() >= self.limit {
+                return Err(io::ErrorKind::Other.into());
+            }
+            let count = buf.len().min(1).min(self.limit - self.bytes.len());
+            self.bytes.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_writer_completion_once() {
+        for payload in [b"".as_slice(), b"hello"] {
+            let mut bytes = Vec::new();
+            let mut state = HttpChunkedTransferWriterState::new(16);
+            let mut writer = HttpChunkedTransferWriter::from_writer_state(&mut bytes, &mut state);
+            writer.write_all(payload).unwrap();
+            writer.flush().unwrap();
+            assert!(writer.corked());
+            let completed = writer.fd.clone();
+            writer.flush().unwrap();
+            writer.cork();
+            writer.flush().unwrap();
+            assert!(writer.write(b"x").is_err());
+            assert_eq!(writer.write(b"").unwrap(), 0);
+            assert_eq!(*writer.fd, completed);
+            let expected = if payload.is_empty() {
+                b"0\r\n\r\n".as_slice()
+            } else {
+                b"5\r\nhello\r\n0\r\n\r\n".as_slice()
+            };
+            assert_eq!(writer.fd.as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn test_writer_failure_is_sticky() {
+        // Exercise every byte boundary in direct chunks, buffered chunks and
+        // the terminator, including failure before any byte is accepted.
+        for chunk_size in [3, 16] {
+            let mut expected = Vec::new();
+            let mut state = HttpChunkedTransferWriterState::new(chunk_size);
+            let mut writer =
+                HttpChunkedTransferWriter::from_writer_state(&mut expected, &mut state);
+            writer.write_all(b"hello").unwrap();
+            writer.flush().unwrap();
+            for limit in 0..expected.len() {
+                let mut output = FaultWriter {
+                    bytes: vec![],
+                    limit,
+                    calls: 0,
+                    interrupt: false,
+                };
+                let mut state = HttpChunkedTransferWriterState::new(chunk_size);
+                {
+                    let mut writer =
+                        HttpChunkedTransferWriter::from_writer_state(&mut output, &mut state);
+                    assert!(writer
+                        .write_all(b"hello")
+                        .and_then(|()| writer.flush())
+                        .is_err());
+                }
+                let calls = output.calls;
+                // Failure persists even when a new wrapper reuses the state.
+                let mut writer =
+                    HttpChunkedTransferWriter::from_writer_state(&mut output, &mut state);
+                assert!(writer.write(b"x").is_err());
+                assert!(writer.flush().is_err());
+                writer.cork();
+                assert!(writer.flush().is_err());
+                assert_eq!(writer.write(b"").unwrap(), 0);
+                assert_eq!(output.calls, calls);
+                assert_eq!(output.bytes, expected[..limit]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_writer_small_writes_and_interruption() {
+        let payload = b"small writes survive interruption";
+        let mut output = FaultWriter {
+            bytes: vec![],
+            limit: usize::MAX,
+            calls: 0,
+            interrupt: true,
+        };
+        let mut state = HttpChunkedTransferWriterState::new(4);
+        let mut writer = HttpChunkedTransferWriter::from_writer_state(&mut output, &mut state);
+        for byte in payload {
+            writer.write_all(&[*byte]).unwrap();
+        }
+        writer.flush().unwrap();
+        let mut input = output.bytes.as_slice();
+        let mut reader = HttpChunkedTransferReader::from_reader(&mut input, 256);
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
 
     /// Simulate reading variable-length segments
     struct SegmentReader {
