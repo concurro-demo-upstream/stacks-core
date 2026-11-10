@@ -23,5 +23,6 @@ pub mod epoch_switch;
 pub mod events;
 pub mod forking;
 pub mod large_contract;
+pub mod marf_read_cache;
 pub mod smoke;
 pub mod utils;

@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -253,6 +254,7 @@ impl MarfedKV {
         PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
+            read_cache: OpenTipReadCache::new(),
         }
     }
 
@@ -281,6 +283,7 @@ impl MarfedKV {
         PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
+            read_cache: OpenTipReadCache::new(),
         }
     }
 
@@ -380,13 +383,91 @@ impl MarfedKV {
     }
 }
 
+/// The maximum number of paths an [`OpenTipReadCache`] holds before it is cleared.
+///
+/// Each entry is a 32-byte [`TrieHash`] plus an `Option<MARFValue>` (41 bytes), so a full cache
+/// takes roughly 4 MiB including `HashMap` overhead.
+const OPEN_TIP_READ_CACHE_MAX_ENTRIES: usize = 32_768;
+
+/// A bounded cache from MARF path to the value the open chain tip resolves it to.
+///
+/// It holds only the resolved `MARFValue` (the hash of the stored value), never the value
+/// itself, so entries have a fixed size.  Absent keys are cached as `None`.
+///
+/// The cache is only correct as long as every change to the open trie's key/value state
+/// invalidates the affected paths; the owning store does this in `put_all_data`.  When the cache is
+/// full, admitting a new path clears it, which can only cause a later re-read, never a different
+/// result.
+struct OpenTipReadCache {
+    /// Resolved values by path.
+    entries: HashMap<TrieHash, Option<MARFValue>>,
+    /// Number of entries at which the next new path clears the cache.
+    max_entries: usize,
+    /// Number of reads served from `entries`.
+    hits: u64,
+    /// Number of reads that had to go to the MARF.
+    misses: u64,
+}
+
+impl OpenTipReadCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: OPEN_TIP_READ_CACHE_MAX_ENTRIES,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up `path`.  Returns `Some(value)` on a hit, where `value` is itself an `Option` since
+    /// absent keys are cached.  Updates the hit/miss counters.
+    fn get(&mut self, path: &TrieHash) -> Option<Option<MARFValue>> {
+        match self.entries.get(path) {
+            Some(value) => {
+                self.hits += 1;
+                Some(value.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Record that `path` resolves to `value` at the open tip.  A new path clears the cache first
+    /// if it is full.
+    fn insert(&mut self, path: TrieHash, value: Option<MARFValue>) {
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&path) {
+            self.entries.clear();
+        }
+        self.entries.insert(path, value);
+    }
+
+    /// Forget `path`, because it is about to be written.
+    fn invalidate(&mut self, path: &TrieHash) {
+        self.entries.remove(path);
+    }
+
+    /// Forget everything.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// A wrapper around a MARF transaction which allows read/write access to the MARF's keys off of a
 /// given chain tip.
+///
+/// Reads addressed to the open chain tip are served from a bounded cache after the first lookup.
+/// The cache lives only as long as this store's MARF transaction, so committing or dropping the
+/// trie discards it.  Within the store, `put_all_data` is the only operation that changes the
+/// open trie, and it invalidates the paths it writes.
 pub struct PersistentWritableMarfStore<'a> {
     /// The chain tip from which reads and writes will be indexed.
     chain_tip: StacksBlockId,
     /// The transaction to the MARF instance
     marf: MarfTransaction<'a, StacksBlockId>,
+    /// Cache of open-tip key lookups.  Reads at any other tip (e.g. via `at-block`) bypass it.
+    read_cache: OpenTipReadCache,
 }
 
 /// A wrapper around a MARF handle which allows only read access to the MARF's keys off of a given
@@ -784,6 +865,41 @@ impl PersistentWritableMarfStore<'_> {
         let bhh = self.chain_tip.clone();
         self.commit_to_processed_block(&bhh).unwrap();
     }
+
+    /// Write `items` to the side-store and the MARF.  Does not touch the read cache; callers
+    /// must invalidate it.
+    fn write_items(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
+        let mut keys = Vec::with_capacity(items.len());
+        let mut values = Vec::with_capacity(items.len());
+        for (key, value) in items.into_iter() {
+            let marf_value = MARFValue::from_value(&value);
+            SqliteConnection::put(self.marf.sqlite_tx(), &marf_value.to_hex(), &value)?;
+            keys.push(key);
+            values.push(marf_value);
+        }
+        self.marf
+            .insert_batch(&keys, values)
+            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
+    }
+
+    /// Number of (hits, misses) of the open-tip read cache so far.
+    #[cfg(test)]
+    pub fn read_cache_stats(&self) -> (u64, u64) {
+        (self.read_cache.hits, self.read_cache.misses)
+    }
+
+    /// Number of paths currently held by the open-tip read cache.
+    #[cfg(test)]
+    pub fn read_cache_len(&self) -> usize {
+        self.read_cache.entries.len()
+    }
+
+    /// Replace the read cache capacity (and empty the cache).
+    #[cfg(test)]
+    pub fn set_read_cache_capacity(&mut self, max_entries: usize) {
+        self.read_cache = OpenTipReadCache::new();
+        self.read_cache.max_entries = max_entries;
+    }
 }
 
 impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
@@ -827,20 +943,41 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
         trace!("MarfedKV get: {:?} tip={}", key, &self.chain_tip);
-        self.marf
-            .get(&self.chain_tip, key)
-            .or_else(|e| match e {
-                Error::NotFoundError => {
-                    trace!(
-                        "MarfedKV get {:?} off of {:?}: not found",
-                        key,
-                        &self.chain_tip
-                    );
-                    Ok(None)
+        let path = TrieHash::from_key(key);
+        // Only reads at the open tip are cached: `put_all_data` invalidates exactly that view.
+        let use_cache = self.marf.get_open_chain_tip() == Some(&self.chain_tip);
+        let cached = if use_cache {
+            self.read_cache.get(&path)
+        } else {
+            None
+        };
+        let marf_value = match cached {
+            Some(marf_value) => marf_value,
+            None => {
+                let marf_value = self
+                    .marf
+                    .get_from_hash(&self.chain_tip, &path)
+                    .or_else(|e| match e {
+                        Error::NotFoundError => {
+                            trace!(
+                                "MarfedKV get {:?} off of {:?}: not found",
+                                key,
+                                &self.chain_tip
+                            );
+                            Ok(None)
+                        }
+                        _ => Err(e),
+                    })
+                    .map_err(|_| {
+                        VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into())
+                    })?;
+                if use_cache {
+                    self.read_cache.insert(path, marf_value.clone());
                 }
-                _ => Err(e),
-            })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+                marf_value
+            }
+        };
+        marf_value
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", key, &side_key);
@@ -999,17 +1136,15 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
-        let mut keys = Vec::with_capacity(items.len());
-        let mut values = Vec::with_capacity(items.len());
-        for (key, value) in items.into_iter() {
-            let marf_value = MARFValue::from_value(&value);
-            SqliteConnection::put(self.marf.sqlite_tx(), &marf_value.to_hex(), &value)?;
-            keys.push(key);
-            values.push(marf_value);
+        for (key, _) in items.iter() {
+            self.read_cache.invalidate(&TrieHash::from_key(key));
         }
-        self.marf
-            .insert_batch(&keys, values)
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
+        let result = self.write_items(items);
+        if result.is_err() {
+            // The trie may be partially updated, so nothing cached can be trusted.
+            self.read_cache.clear();
+        }
+        result
     }
 
     fn get_contract_hash(

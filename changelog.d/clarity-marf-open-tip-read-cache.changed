@@ -1,0 +1,1 @@
+Repeated reads of the same key from the open block's Clarity state are served from a bounded per-block cache instead of re-walking the MARF; state roots, proofs, costs, schemas and the wire format are unchanged.
