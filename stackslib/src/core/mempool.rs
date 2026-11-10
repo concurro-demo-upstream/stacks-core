@@ -376,6 +376,20 @@ impl MemPoolAdmitter {
     }
 }
 
+/// What the mempool would do about a new transaction whose origin or sponsor nonce is already
+/// used by a transaction in the mempool.  See `MemPoolDB::find_nonce_conflict()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemPoolNonceConflict {
+    /// The new transaction pays a strictly higher fee, so it replaces the prior one
+    ReplaceByFee,
+    /// The new transaction does not pay a higher fee, but the prior one is in a different fork,
+    /// so the new transaction replaces it
+    ReplaceAcrossFork,
+    /// The prior transaction is in the same fork and its fee is at least the new fee, so the new
+    /// transaction is rejected
+    Reject,
+}
+
 pub enum MemPoolDropReason {
     REPLACE_ACROSS_FORK,
     REPLACE_BY_FEE,
@@ -2048,6 +2062,75 @@ impl MemPoolDB {
         }
     }
 
+    /// Find the mempool transaction, if any, which would conflict with a transaction that has
+    /// the given origin and sponsor nonces, and decide what `try_add_tx()` would do about it.
+    /// The prior transaction is looked up by (origin address, origin nonce) first, and then by
+    /// (sponsor address, sponsor nonce).
+    ///
+    /// `tenure_consensus_hash` and `tenure_block_header_hash` identify the tenure the new
+    /// transaction would arrive in.  They must already be resolved to the tenure-start block
+    /// (see `try_add_tx()`); this function does not do that resolution.
+    ///
+    /// Returns `None` if there is no conflicting transaction.  Otherwise returns the prior
+    /// transaction's metadata along with the decision:
+    /// * `ReplaceByFee` if `tx_fee` is strictly greater than the prior transaction's fee
+    /// * `ReplaceAcrossFork` if it is not, but the prior transaction's tenure is not in the same
+    ///   fork as the given tenure
+    /// * `Reject` otherwise
+    ///
+    /// This function only reads from `conn`.  It never modifies the mempool or its bloom filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `db_error` if the mempool lookup or the fork check fails.
+    pub fn find_nonce_conflict(
+        conn: &DBConn,
+        chainstate: &mut StacksChainState,
+        tenure_consensus_hash: &ConsensusHash,
+        tenure_block_header_hash: &BlockHeaderHash,
+        tx_fee: u64,
+        origin_address: &StacksAddress,
+        origin_nonce: u64,
+        sponsor_address: &StacksAddress,
+        sponsor_nonce: u64,
+    ) -> Result<Option<(MemPoolTxMetadata, MemPoolNonceConflict)>, db_error> {
+        let prior_tx = match MemPoolDB::get_tx_metadata_by_address(
+            conn,
+            true,
+            origin_address,
+            origin_nonce,
+        )? {
+            Some(prior_tx) => prior_tx,
+            None => {
+                match MemPoolDB::get_tx_metadata_by_address(
+                    conn,
+                    false,
+                    sponsor_address,
+                    sponsor_nonce,
+                )? {
+                    Some(prior_tx) => prior_tx,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        let outcome = if tx_fee > prior_tx.tx_fee {
+            MemPoolNonceConflict::ReplaceByFee
+        } else if !MemPoolDB::are_blocks_in_same_fork(
+            chainstate,
+            &prior_tx.tenure_consensus_hash,
+            &prior_tx.tenure_block_header_hash,
+            tenure_consensus_hash,
+            tenure_block_header_hash,
+        )? {
+            MemPoolNonceConflict::ReplaceAcrossFork
+        } else {
+            MemPoolNonceConflict::Reject
+        };
+
+        Ok(Some((prior_tx, outcome)))
+    }
+
     /// Add a transaction to the mempool.  If it already exists, then replace it if the given fee
     /// is higher than the one that's already there.
     /// Carry out the mempool admission test before adding.
@@ -2113,45 +2196,39 @@ impl MemPoolDB {
         };
 
         // do we already have txs with either the same origin nonce or sponsor nonce ?
-        let prior_tx = {
-            match MemPoolDB::get_tx_metadata_by_address(tx, true, origin_address, origin_nonce)? {
-                Some(prior_tx) => Some(prior_tx),
-                None => MemPoolDB::get_tx_metadata_by_address(
-                    tx,
-                    false,
-                    sponsor_address,
-                    sponsor_nonce,
-                )?,
-            }
-        };
+        // if so, is this a replace-by-fee? or a replace-in-chain-tip?
+        let conflict = MemPoolDB::find_nonce_conflict(
+            tx,
+            chainstate,
+            &consensus_hash,
+            &block_header_hash,
+            tx_fee,
+            origin_address,
+            origin_nonce,
+            sponsor_address,
+            sponsor_nonce,
+        )?;
 
         let mut replace_reason = MemPoolDropReason::REPLACE_BY_FEE;
 
-        // if so, is this a replace-by-fee? or a replace-in-chain-tip?
-        let add_tx = if let Some(ref prior_tx) = prior_tx {
-            if tx_fee > prior_tx.tx_fee {
-                // is this a replace-by-fee ?
+        let (prior_tx, add_tx) = match conflict {
+            Some((prior_tx, MemPoolNonceConflict::ReplaceByFee)) => {
                 debug!(
                     "Can replace {} with {} for {},{} by fee ({} < {})",
                     &prior_tx.txid, &txid, origin_address, origin_nonce, &prior_tx.tx_fee, &tx_fee
                 );
                 replace_reason = MemPoolDropReason::REPLACE_BY_FEE;
-                true
-            } else if !MemPoolDB::are_blocks_in_same_fork(
-                chainstate,
-                &prior_tx.tenure_consensus_hash,
-                &prior_tx.tenure_block_header_hash,
-                &consensus_hash,
-                &block_header_hash,
-            )? {
-                // is this a replace-across-fork ?
+                (Some(prior_tx), true)
+            }
+            Some((prior_tx, MemPoolNonceConflict::ReplaceAcrossFork)) => {
                 debug!(
                     "Can replace {} with {} for {},{} across fork",
                     &prior_tx.txid, &txid, origin_address, origin_nonce
                 );
                 replace_reason = MemPoolDropReason::REPLACE_ACROSS_FORK;
-                true
-            } else {
+                (Some(prior_tx), true)
+            }
+            Some((prior_tx, MemPoolNonceConflict::Reject)) => {
                 // there's a >= fee tx in this fork, cannot add
                 info!("TX conflicts with sponsor/origin nonce in same fork with >= fee";
                       "new_txid" => %txid,
@@ -2162,11 +2239,10 @@ impl MemPoolDB {
                       "sponsor_nonce" => sponsor_nonce,
                       "new_fee" => tx_fee,
                       "old_fee" => prior_tx.tx_fee);
-                false
+                (Some(prior_tx), false)
             }
-        } else {
             // no conflicting TX with this origin/sponsor, go ahead and add
-            true
+            None => (None, true),
         };
 
         if !add_tx {

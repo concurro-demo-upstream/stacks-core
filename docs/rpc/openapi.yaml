@@ -2540,6 +2540,17 @@ paths:
         A `tip` naming a block that does not exist returns 404. A `tip` naming
         a block that exists but cannot be simulated by this endpoint (for
         example an epoch-2.x block) returns 400.
+
+        The response also reports, in `mempool_conflict`, whether the mempool
+        holds a transaction with the same origin nonce (or, for a sponsored
+        transaction, the same sponsor nonce) and what the mempool would do with
+        the simulated transaction at submission. A conflict does not change the
+        status code; the simulation result is returned as usual. The check only
+        compares nonces and fees relative to the tenure of the requested `tip`;
+        it does not run the other mempool admission checks, and it is advisory
+        because the mempool can change after the response is returned. The
+        mempool is never modified. If the mempool cannot be checked, the
+        request fails with 500.
       requestBody:
         required: true
         content:
@@ -2600,6 +2611,43 @@ paths:
                       - string
                       - "null"
                     description: VM error, if any
+                  mempool_conflict:
+                    type:
+                      - object
+                      - "null"
+                    description: |
+                      The mempool transaction that uses the same origin (or
+                      sponsor) nonce as the simulated transaction, or `null` if
+                      there is none.
+                    required:
+                      - txid
+                      - tx_fee
+                      - outcome
+                    properties:
+                      txid:
+                        type: string
+                        description: The transaction ID of the conflicting mempool transaction
+                      tx_fee:
+                        type: integer
+                        description: Total fee of the conflicting mempool transaction, in microSTX
+                      outcome:
+                        type: string
+                        enum:
+                          - already_in_mempool
+                          - replace_by_fee
+                          - replace_across_fork
+                          - rejected
+                        description: |
+                          What the mempool would do with the simulated
+                          transaction. `already_in_mempool`: the mempool
+                          already holds this exact transaction.
+                          `replace_by_fee`: the simulated transaction pays a
+                          higher fee and would replace the mempool transaction.
+                          `replace_across_fork`: the mempool transaction is in
+                          a different fork, so the simulated transaction would
+                          replace it. `rejected`: the mempool transaction is in
+                          the same fork and pays at least as much, so the
+                          simulated transaction would be rejected.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

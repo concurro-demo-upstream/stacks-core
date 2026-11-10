@@ -1,0 +1,1 @@
+Added a `mempool_conflict` field to the `/v3/transactions/simulate` response, which reports a mempool transaction with the same origin or sponsor nonce as the simulated transaction and whether the simulated transaction would replace it (`replace_by_fee`, `replace_across_fork`) or be rejected.

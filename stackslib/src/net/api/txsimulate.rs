@@ -37,6 +37,7 @@ use crate::chainstate::stacks::miner::{
 };
 use crate::chainstate::stacks::{Error as ChainError, StacksTransaction};
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
+use crate::core::mempool::{MemPoolDB, MemPoolNonceConflict};
 use crate::net::http::{
     parse_json, Error, HttpBadRequest, HttpContentType, HttpNotFound, HttpRequest,
     HttpRequestContents, HttpRequestPreamble, HttpResponse, HttpResponseContents,
@@ -46,6 +47,7 @@ use crate::net::httpcore::{
     HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttpResponse,
 };
 use crate::net::{Error as NetError, StacksHttpRequest, StacksNodeState, TipRequest};
+use crate::util_lib::db::DBConn;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RPCTransactionSimulateBody {
@@ -75,6 +77,8 @@ pub enum TxSimulateError {
     InvalidTransaction(String),
     /// Internal chainstate failure (HTTP 500)
     Chain(ChainError),
+    /// The mempool could not be checked for conflicting transactions (HTTP 500)
+    MemPool(String),
 }
 
 impl From<ChainError> for TxSimulateError {
@@ -246,6 +250,105 @@ impl RPCTransactionSimulateRequestHandler {
             execution_limit,
         )?)
     }
+
+    /// Check whether the mempool holds a transaction that conflicts with `tx`, i.e. one with the
+    /// same origin nonce or (if `tx` is sponsored) the same sponsor nonce, and report what
+    /// `/v2/transactions` would do about it.  The check is relative to the tenure of
+    /// `tip_block_id`, exactly as mempool admission is.  It is read-only: the mempool is never
+    /// modified, and none of the other admission checks are run.
+    ///
+    /// Returns `None` if there is no conflicting mempool transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TxSimulateError::MemPool` if the tip's tenure start cannot be resolved or the
+    /// mempool lookup fails.
+    pub fn check_mempool_conflict(
+        tx: &StacksTransaction,
+        tip_block_id: &StacksBlockId,
+        chainstate: &mut StacksChainState,
+        mempool_conn: &DBConn,
+    ) -> Result<Option<RPCMempoolConflict>, TxSimulateError> {
+        let tip_header = NakamotoChainState::get_block_header(chainstate.db(), tip_block_id)
+            .map_err(|e| TxSimulateError::MemPool(format!("Failed to load chain tip: {e:?}")))?
+            .ok_or_else(|| TxSimulateError::MemPool("Chain tip not found".into()))?;
+
+        let tenure_start_header = NakamotoChainState::get_tenure_start_block_header(
+            &mut chainstate.index_conn(),
+            tip_block_id,
+            &tip_header.consensus_hash,
+        )
+        .map_err(|e| TxSimulateError::MemPool(format!("Failed to load tenure start block: {e:?}")))?
+        .ok_or_else(|| TxSimulateError::MemPool("Tenure start block not found".into()))?;
+
+        let origin_address = tx.origin_address();
+        let origin_nonce = tx.get_origin_nonce();
+        let (sponsor_address, sponsor_nonce) =
+            if let (Some(addr), Some(nonce)) = (tx.sponsor_address(), tx.get_sponsor_nonce()) {
+                (addr, nonce)
+            } else {
+                (origin_address.clone(), origin_nonce)
+            };
+
+        let conflict = MemPoolDB::find_nonce_conflict(
+            mempool_conn,
+            chainstate,
+            &tenure_start_header.consensus_hash,
+            &tenure_start_header.anchored_header.block_hash(),
+            tx.get_tx_fee(),
+            &origin_address,
+            origin_nonce,
+            &sponsor_address,
+            sponsor_nonce,
+        )
+        .map_err(|e| TxSimulateError::MemPool(format!("{e:?}")))?;
+
+        Ok(conflict.map(|(prior_tx, conflict)| {
+            let outcome = if prior_tx.txid == tx.txid() {
+                RPCMempoolConflictOutcome::AlreadyInMempool
+            } else {
+                match conflict {
+                    MemPoolNonceConflict::ReplaceByFee => RPCMempoolConflictOutcome::ReplaceByFee,
+                    MemPoolNonceConflict::ReplaceAcrossFork => {
+                        RPCMempoolConflictOutcome::ReplaceAcrossFork
+                    }
+                    MemPoolNonceConflict::Reject => RPCMempoolConflictOutcome::Rejected,
+                }
+            };
+            RPCMempoolConflict {
+                txid: prior_tx.txid,
+                tx_fee: prior_tx.tx_fee,
+                outcome,
+            }
+        }))
+    }
+}
+
+/// How the mempool would treat a simulated transaction that conflicts with a transaction it
+/// already holds
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RPCMempoolConflictOutcome {
+    /// The mempool already holds this exact transaction
+    AlreadyInMempool,
+    /// The simulated transaction pays a higher fee and would replace the mempool transaction
+    ReplaceByFee,
+    /// The mempool transaction is in a different fork, so the simulated transaction would replace it
+    ReplaceAcrossFork,
+    /// The mempool transaction is in the same fork and pays at least as much, so the simulated
+    /// transaction would be rejected
+    Rejected,
+}
+
+/// A mempool transaction which uses the same origin or sponsor nonce as a simulated transaction
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct RPCMempoolConflict {
+    /// id of the conflicting mempool transaction
+    pub txid: Txid,
+    /// total fee of the conflicting mempool transaction, in microSTX
+    pub tx_fee: u64,
+    /// what the mempool would do with the simulated transaction
+    pub outcome: RPCMempoolConflictOutcome,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -273,6 +376,10 @@ pub struct RPCSimulatedTransaction {
     pub post_condition_aborted: bool,
     /// optional vm error
     pub vm_error: Option<BoundedErrorString>,
+    /// a mempool transaction with the same origin or sponsor nonce, if any.  This is advisory:
+    /// only nonces are compared, and the mempool may change after the response is sent.
+    #[serde(default)]
+    pub mempool_conflict: Option<RPCMempoolConflict>,
 }
 
 impl RPCSimulatedTransaction {
@@ -314,6 +421,7 @@ impl RPCSimulatedTransaction {
             events,
             post_condition_aborted: receipt.post_condition_aborted,
             vm_error: receipt.vm_error.clone(),
+            mempool_conflict: None,
         })
     }
 }
@@ -409,7 +517,7 @@ impl RPCRequestHandler for RPCTransactionSimulateRequestHandler {
         };
 
         let simulated_tx_res =
-            node.with_node_state(|network, sortdb, chainstate, _mempool, _rpc_args| {
+            node.with_node_state(|network, sortdb, chainstate, mempool, _rpc_args| {
                 // apply the same per-transaction limits the signers enforce
                 // during block proposal validation
                 let max_tx_execution_time = Duration::from_secs(
@@ -423,7 +531,7 @@ impl RPCRequestHandler for RPCTransactionSimulateRequestHandler {
                         .block_proposal_max_tx_analysis_time_secs,
                 );
                 let max_tx_mem_bytes = network.connection_opts.block_proposal_max_tx_mem_bytes;
-                Self::transaction_simulate(
+                let mut simulated_tx = Self::transaction_simulate(
                     &tx,
                     &tip_block_id,
                     sortdb,
@@ -431,7 +539,10 @@ impl RPCRequestHandler for RPCTransactionSimulateRequestHandler {
                     max_tx_execution_time,
                     max_tx_analysis_time,
                     max_tx_mem_bytes,
-                )
+                )?;
+                simulated_tx.mempool_conflict =
+                    Self::check_mempool_conflict(&tx, &tip_block_id, chainstate, mempool.conn())?;
+                Ok(simulated_tx)
             });
 
         let simulated_tx = match simulated_tx_res {
@@ -462,6 +573,12 @@ impl RPCRequestHandler for RPCTransactionSimulateRequestHandler {
             Err(TxSimulateError::Chain(e)) => {
                 // nope -- error trying to simulate
                 let msg = format!("Failed to simulate transaction: {e:?}\n");
+                warn!("{}", &msg);
+                return StacksHttpResponse::new_error(&preamble, &HttpServerError::new(msg))
+                    .try_into_contents();
+            }
+            Err(TxSimulateError::MemPool(reason)) => {
+                let msg = format!("Failed to check mempool for conflicts: {reason}\n");
                 warn!("{}", &msg);
                 return StacksHttpResponse::new_error(&preamble, &HttpServerError::new(msg))
                     .try_into_contents();

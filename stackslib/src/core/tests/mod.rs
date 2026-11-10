@@ -54,8 +54,9 @@ use crate::chainstate::stacks::{
     TransactionSpendingCondition, TransactionVersion,
 };
 use crate::core::mempool::{
-    db_get_all_nonces, MemPoolSyncData, MemPoolWalkSettings, MemPoolWalkTxTypes, TxTag,
-    BLOOM_COUNTER_DEPTH, BLOOM_COUNTER_ERROR_RATE, MAX_BLOOM_COUNTER_TXS,
+    db_get_all_nonces, MemPoolNonceConflict, MemPoolSyncData, MemPoolWalkSettings,
+    MemPoolWalkTxTypes, TxTag, BLOOM_COUNTER_DEPTH, BLOOM_COUNTER_ERROR_RATE,
+    MAX_BLOOM_COUNTER_TXS,
 };
 use crate::core::test_util::{insert_tx_in_mempool, make_stacks_transfer_serialized, to_addr};
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
@@ -1330,6 +1331,218 @@ fn mempool_do_not_replace_tx() {
 
     assert!(MemPoolDB::db_has_tx(&mempool_tx, &prior_txid).unwrap());
     assert!(!MemPoolDB::db_has_tx(&mempool_tx, &txid).unwrap());
+}
+
+/// `MemPoolDB::find_nonce_conflict` reports the same decision `try_add_tx` would make for a
+/// candidate transaction, and never modifies the mempool.
+///
+/// The prior transaction P is stored at b_2.  b_1 is an ancestor of b_2 (same fork), while b_3 is
+/// a sibling of b_2 under b_1 (different fork).
+#[test]
+fn mempool_find_nonce_conflict() {
+    let mut chainstate = TestChainstateBuilder::new_testnet(function_name!()).build();
+
+    // genesis -> b_1 -> b_2
+    //              \-> b_3
+    let b_1 = make_block(
+        &mut chainstate,
+        ConsensusHash([0x1; 20]),
+        &(
+            FIRST_BURNCHAIN_CONSENSUS_HASH.clone(),
+            FIRST_STACKS_BLOCK_HASH.clone(),
+        ),
+        1,
+        1,
+    );
+    let b_2 = make_block(&mut chainstate, ConsensusHash([0x2; 20]), &b_1, 2, 2);
+    let b_3 = make_block(&mut chainstate, ConsensusHash([0x3; 20]), &b_1, 2, 2);
+
+    let chainstate_path = chainstate_path(function_name!());
+    let mut mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
+
+    let txs = codec_all_transactions(
+        &TransactionVersion::Testnet,
+        0x80000000,
+        &TransactionAnchorMode::Any,
+        &TransactionPostConditionMode::Allow,
+        StacksEpochId::latest(),
+    );
+    let mut tx = txs.last().unwrap().clone();
+
+    let origin_address = StacksAddress::new(22, Hash160::from_data(&[0; 32])).unwrap();
+    let sponsor_address = StacksAddress::new(22, Hash160::from_data(&[1; 32])).unwrap();
+    let other_address = StacksAddress::new(22, Hash160::from_data(&[2; 32])).unwrap();
+    let other_address_2 = StacksAddress::new(22, Hash160::from_data(&[3; 32])).unwrap();
+
+    let origin_nonce = tx.get_origin_nonce();
+    let sponsor_nonce = tx.get_sponsor_nonce().unwrap_or(origin_nonce);
+
+    // store the prior tx P (fee 123) at b_2
+    tx.set_tx_fee(123);
+    let prior_txid = tx.txid();
+    {
+        let mut mempool_tx = mempool.tx_begin().unwrap();
+        MemPoolDB::try_add_tx(
+            &mut mempool_tx,
+            &mut chainstate,
+            &b_2.0,
+            &b_2.1,
+            true,
+            &prior_txid,
+            tx.serialize_to_vec(),
+            123,
+            100,
+            &origin_address,
+            origin_nonce,
+            &sponsor_address,
+            sponsor_nonce,
+            None,
+        )
+        .unwrap();
+        mempool_tx.commit().unwrap();
+    }
+
+    let find = |chainstate: &mut StacksChainState,
+                mempool: &MemPoolDB,
+                tenure: &(ConsensusHash, BlockHeaderHash),
+                fee: u64,
+                origin: (&StacksAddress, u64),
+                sponsor: (&StacksAddress, u64)| {
+        MemPoolDB::find_nonce_conflict(
+            mempool.conn(),
+            chainstate,
+            &tenure.0,
+            &tenure.1,
+            fee,
+            origin.0,
+            origin.1,
+            sponsor.0,
+            sponsor.1,
+        )
+        .unwrap()
+        .map(|(prior, outcome)| {
+            assert_eq!(prior.txid, prior_txid);
+            assert_eq!(prior.tx_fee, 123);
+            outcome
+        })
+    };
+
+    let same = (&origin_address, origin_nonce);
+    let same_sponsor = (&sponsor_address, sponsor_nonce);
+
+    // different origin and sponsor nonces: no conflict
+    assert_eq!(
+        find(
+            &mut chainstate,
+            &mempool,
+            &b_2,
+            124,
+            (&origin_address, origin_nonce + 1),
+            (&sponsor_address, sponsor_nonce + 1)
+        ),
+        None
+    );
+    // same nonces, but different addresses: no conflict
+    assert_eq!(
+        find(
+            &mut chainstate,
+            &mempool,
+            &b_2,
+            124,
+            (&other_address, origin_nonce),
+            (&other_address_2, sponsor_nonce)
+        ),
+        None
+    );
+
+    // higher fee: replace-by-fee
+    assert_eq!(
+        find(&mut chainstate, &mempool, &b_2, 124, same, same_sponsor),
+        Some(MemPoolNonceConflict::ReplaceByFee)
+    );
+    // identical fee in the same tenure: rejected
+    assert_eq!(
+        find(&mut chainstate, &mempool, &b_2, 123, same, same_sponsor),
+        Some(MemPoolNonceConflict::Reject)
+    );
+    // lower fee at an ancestor of P's tenure (same fork): rejected
+    assert_eq!(
+        find(&mut chainstate, &mempool, &b_1, 100, same, same_sponsor),
+        Some(MemPoolNonceConflict::Reject)
+    );
+    // lower and identical fee at a sibling tenure (different fork): replace-across-fork
+    assert_eq!(
+        find(&mut chainstate, &mempool, &b_3, 100, same, same_sponsor),
+        Some(MemPoolNonceConflict::ReplaceAcrossFork)
+    );
+    assert_eq!(
+        find(&mut chainstate, &mempool, &b_3, 123, same, same_sponsor),
+        Some(MemPoolNonceConflict::ReplaceAcrossFork)
+    );
+    // free origin nonce, but the sponsor (address, nonce) matches P's: found via the sponsor lookup
+    assert_eq!(
+        find(
+            &mut chainstate,
+            &mempool,
+            &b_2,
+            100,
+            (&other_address, origin_nonce),
+            same_sponsor
+        ),
+        Some(MemPoolNonceConflict::Reject)
+    );
+
+    // the checks above were read-only: P is still the only tx in the mempool
+    let all_txs = MemPoolDB::get_all_txs(mempool.conn()).unwrap();
+    assert_eq!(all_txs.len(), 1);
+    assert_eq!(all_txs[0].tx.txid(), prior_txid);
+
+    // admission agrees with the helper: a fresh lower-fee candidate is rejected at the ancestor
+    // tenure b_1 ...
+    tx.set_tx_fee(99);
+    let candidate_txid = tx.txid();
+    {
+        let mut mempool_tx = mempool.tx_begin().unwrap();
+        let err = MemPoolDB::try_add_tx(
+            &mut mempool_tx,
+            &mut chainstate,
+            &b_1.0,
+            &b_1.1,
+            true,
+            &candidate_txid,
+            tx.serialize_to_vec(),
+            99,
+            100,
+            &origin_address,
+            origin_nonce,
+            &sponsor_address,
+            sponsor_nonce,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MemPoolRejection::ConflictingNonceInMempool));
+
+        // ... but replaces P across forks at the sibling tenure b_3
+        MemPoolDB::try_add_tx(
+            &mut mempool_tx,
+            &mut chainstate,
+            &b_3.0,
+            &b_3.1,
+            true,
+            &candidate_txid,
+            tx.serialize_to_vec(),
+            99,
+            100,
+            &origin_address,
+            origin_nonce,
+            &sponsor_address,
+            sponsor_nonce,
+            None,
+        )
+        .unwrap();
+        assert!(!MemPoolDB::db_has_tx(&mempool_tx, &prior_txid).unwrap());
+        assert!(MemPoolDB::db_has_tx(&mempool_tx, &candidate_txid).unwrap());
+    }
 }
 
 #[rstest]
