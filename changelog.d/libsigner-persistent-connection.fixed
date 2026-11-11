@@ -1,0 +1,1 @@
+`StackerDBSession` in libsigner now reuses its HTTP connection to the node across requests instead of reconnecting for every request, and reconnects when the node has closed an idle connection or the target host has changed.

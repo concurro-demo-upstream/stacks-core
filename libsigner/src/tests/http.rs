@@ -14,14 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::{io, str};
 
 use hashbrown::HashMap;
 use stacks_common::util::chunked_encoding::*;
 
 use crate::error::RPCError;
-use crate::http::{decode_http_body, decode_http_response, run_http_request};
+use crate::http::{
+    decode_http_body, decode_http_response, read_http_response, run_http_request, MAX_HTTP_HEADERS,
+    MAX_HTTP_HEADER_LEN,
+};
 
 #[test]
 fn test_decode_http_response_ok() {
@@ -266,4 +269,136 @@ fn test_run_http_request_no_body() {
         assert!(result_chunked.is_empty());
         assert!(result_plain.is_empty());
     }
+}
+
+/// Encode `body` as an HTTP chunked body, 5 bytes per chunk
+fn chunk_encode(body: &[u8]) -> Vec<u8> {
+    let mut state = HttpChunkedTransferWriterState::new(5);
+    let mut buf = vec![];
+    let mut fd = HttpChunkedTransferWriter::from_writer_state(&mut buf, &mut state);
+    fd.write_all(body).unwrap();
+    fd.flush().unwrap();
+    buf
+}
+
+/// Two responses in one stream, one `Content-Length` and one chunked, are read one at a time,
+/// each leaves the stream positioned at the next response, and both are reusable.
+#[test]
+fn test_read_http_response_back_to_back() {
+    let mut stream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+    stream.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    stream.extend_from_slice(&chunk_encode(b"this is the song that never ends"));
+    stream.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let mut sock = Cursor::new(stream);
+
+    let resp = read_http_response(&mut sock).unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"hello");
+    assert!(resp.reusable);
+
+    let resp = read_http_response(&mut sock).unwrap();
+    assert_eq!(resp.body, b"this is the song that never ends");
+    assert!(resp.reusable);
+
+    let resp = read_http_response(&mut sock).unwrap();
+    assert!(resp.body.is_empty());
+    assert!(resp.reusable);
+
+    // the stream is exhausted: no more response bytes
+    match read_http_response(&mut sock) {
+        Err(RPCError::IO(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+        other => panic!("expected EOF error, got {other:?}"),
+    }
+}
+
+/// Responses that do not allow the connection to carry another request are not reusable.
+#[test]
+fn test_read_http_response_not_reusable() {
+    let tests: [&[u8]; 3] = [
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+        b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        // no framing: body runs to EOF
+        b"HTTP/1.1 200 OK\r\n\r\nhello",
+    ];
+    for data in tests {
+        let resp = read_http_response(&mut Cursor::new(data.to_vec())).unwrap();
+        assert_eq!(resp.body, b"hello");
+        assert!(!resp.reusable);
+    }
+
+    // a chunked head followed by EOF is an empty, non-reusable response
+    let resp = read_http_response(&mut Cursor::new(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+    ))
+    .unwrap();
+    assert!(resp.body.is_empty());
+    assert!(!resp.reusable);
+}
+
+/// Truncated bodies and oversized or invalid framing are rejected.
+#[test]
+fn test_read_http_response_errors() {
+    // partial chunked body
+    let mut data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    data.extend_from_slice(b"5\r\nhel");
+    assert!(matches!(
+        read_http_response(&mut Cursor::new(data)),
+        Err(RPCError::MalformedResponse(_))
+    ));
+
+    // short Content-Length body
+    assert!(matches!(
+        read_http_response(&mut Cursor::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello".to_vec()
+        )),
+        Err(RPCError::MalformedResponse(_))
+    ));
+
+    // Content-Length above the maximum message length is rejected before reading the body
+    assert!(matches!(
+        read_http_response(&mut Cursor::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4294967295\r\n\r\n".to_vec()
+        )),
+        Err(RPCError::MalformedResponse(_))
+    ));
+    assert!(matches!(
+        read_http_response(&mut Cursor::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n".to_vec()
+        )),
+        Err(RPCError::MalformedResponse(_))
+    ));
+
+    // oversized head
+    let mut data = b"HTTP/1.1 200 OK\r\n".to_vec();
+    data.extend(std::iter::repeat_n(
+        b'a',
+        MAX_HTTP_HEADERS * MAX_HTTP_HEADER_LEN,
+    ));
+    assert!(matches!(
+        read_http_response(&mut Cursor::new(data)),
+        Err(RPCError::MalformedResponse(_))
+    ));
+
+    // truncated head
+    assert!(matches!(
+        read_http_response(&mut Cursor::new(b"HTTP/1.1 200".to_vec())),
+        Err(RPCError::MalformedResponse(_))
+    ));
+}
+
+/// A framed non-200 response reports its status, has its body consumed, and stays reusable.
+#[test]
+fn test_read_http_response_non_200() {
+    let mut stream = b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope".to_vec();
+    stream.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let mut sock = Cursor::new(stream);
+
+    let resp = read_http_response(&mut sock).unwrap();
+    assert_eq!(resp.status, 404);
+    assert_eq!(resp.body, b"nope");
+    assert!(resp.reusable);
+
+    let resp = read_http_response(&mut sock).unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"ok");
 }
