@@ -33,7 +33,7 @@ pub mod poison_microblock;
 mod post_conditions;
 #[cfg(any(test, doctest))]
 mod tests;
-mod validation;
+pub(crate) mod validation;
 
 fn noop_transaction_check(_receipt: &StacksTransactionReceipt) -> Result<(), Error> {
     Ok(())

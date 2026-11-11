@@ -30,6 +30,7 @@ use stacks_common::util::vrf::*;
 
 use crate::chainstate::burn::operations::*;
 use crate::chainstate::burn::{ConsensusHash, *};
+use crate::chainstate::stacks::db::transactions::processing::validation::check_transaction_epoch_gates;
 use crate::chainstate::stacks::db::StacksBlockHeaderTypes;
 use crate::chainstate::stacks::{Error, StacksBlockHeader, StacksMicroblockHeader, *};
 use crate::core::*;
@@ -561,25 +562,29 @@ impl StacksBlock {
         true
     }
 
-    /// Verify that one transaction is supported in the given epoch, as indicated by `epoch_id`
+    /// Verify that one transaction is supported in the given epoch, as indicated by `epoch_id`.
+    ///
+    /// Applies the content gates shared with transaction precheck
+    /// (`check_transaction_epoch_gates`), plus gates that only apply to block inclusion:
+    /// coinbase VRF proof and alt-recipient, versioned deploys before Epoch 2.1, and
+    /// `TenureChange` before Epoch 3.0. The block-only gates are not in precheck because Epoch 2.x
+    /// microblock transactions get no other per-transaction epoch check, so applying them there
+    /// could change which historical transactions are accepted.
     pub fn validate_transaction_static_epoch(
         tx: &StacksTransaction,
         epoch_id: StacksEpochId,
     ) -> bool {
-        if let Err(reason) = stacks_transactions::check_post_conditions_supported_in_epoch(
-            &tx.post_conditions,
-            &tx.post_condition_mode,
-            epoch_id,
-        ) {
-            error!("{reason}"; "txid" => %tx.txid(), "epoch_id" => %epoch_id);
-            return false;
+        // This must stay ahead of the shared gates: the versioned-deploy check there panics at
+        // Epoch 1.0, which this guard rejects first.
+        if let TransactionPayload::SmartContract(_, Some(_)) = &tx.payload {
+            if epoch_id < StacksEpochId::Epoch21 {
+                // not supported
+                error!("Versioned smart contracts not supported before Stacks 2.1"; "txid" => %tx.txid());
+                return false;
+            }
         }
-        if let Err(reason) = stacks_transactions::check_contract_names_supported_in_epoch(
-            &tx.payload,
-            &tx.post_conditions,
-            epoch_id,
-        ) {
-            error!("{reason}"; "txid" => %tx.txid(), "epoch_id" => %epoch_id);
+        if let Err(msg) = check_transaction_epoch_gates(tx, epoch_id) {
+            error!("{msg}"; "txid" => %tx.txid(), "epoch_id" => %epoch_id);
             return false;
         }
         if let TransactionPayload::Coinbase(_, ref recipient_opt, ref proof_opt) = &tx.payload {
@@ -596,19 +601,6 @@ impl StacksBlock {
             if recipient_opt.is_some() && epoch_id < StacksEpochId::Epoch21 {
                 // not supported
                 error!("Coinbase pay-to-alt-recipient not supported before Stacks 2.1"; "txid" => %tx.txid());
-                return false;
-            }
-        }
-        if let TransactionPayload::SmartContract(_, Some(version)) = &tx.payload {
-            if epoch_id < StacksEpochId::Epoch21 {
-                // not supported
-                error!("Versioned smart contracts not supported before Stacks 2.1"; "txid" => %tx.txid());
-                return false;
-            }
-            if let Err(reason) =
-                stacks_transactions::check_versioned_deploy_supported_in_epoch(*version, epoch_id)
-            {
-                error!("Smart contract deploy {reason}"; "txid" => %tx.txid());
                 return false;
             }
         }

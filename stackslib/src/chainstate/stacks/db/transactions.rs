@@ -970,6 +970,229 @@ pub mod test {
         };
     }
 
+    /// Signs a testnet transaction that passes every precheck check except the epoch gates under
+    /// test (auth, signature, chain ID and network version are all valid).
+    fn sign_testnet_tx_for_gate_test(
+        payload: TransactionPayload,
+        post_condition_mode: TransactionPostConditionMode,
+        post_conditions: Vec<TransactionPostCondition>,
+    ) -> StacksTransaction {
+        let sk = Secp256k1PrivateKey::random();
+        let tx = StacksTransaction {
+            version: TransactionVersion::Testnet,
+            chain_id: 0x80000000,
+            auth: TransactionAuth::from_p2pkh(&sk).unwrap(),
+            anchor_mode: TransactionAnchorMode::Any,
+            post_condition_mode,
+            post_conditions,
+            payload,
+        };
+        let mut signer = StacksTransactionSigner::new(&tx);
+        signer.sign_origin(&sk).unwrap();
+        signer.get_tx().unwrap()
+    }
+
+    fn deploy_payload_for_gate_test(version: Option<ClarityVersion>) -> TransactionPayload {
+        TransactionPayload::SmartContract(
+            TransactionSmartContract {
+                name: ContractName::from_literal("test-contract"),
+                code_body: StacksString::from_str("(define-public (ping) (ok true))").unwrap(),
+            },
+            version,
+        )
+    }
+
+    /// The epoch gates on transaction content are shared by the precheck and static block
+    /// validation (`check_transaction_epoch_gates`). For each gate, across epoch boundaries from
+    /// Epoch 2.0, the precheck must reject exactly when static block validation does, with the
+    /// reason text in the precheck message.
+    #[test]
+    fn precheck_and_static_validation_agree_on_shared_epoch_gates() {
+        let transfer = |recipient: PrincipalData| {
+            TransactionPayload::TokenTransfer(recipient, 123, TokenTransferMemo([0u8; 34]))
+        };
+        let plain_recipient: PrincipalData =
+            StacksAddress::new(1, Hash160([0x11; 20])).unwrap().into();
+        let overlong_recipient = PrincipalData::Contract(QualifiedContractIdentifier::new(
+            StandardPrincipalData::transient(),
+            ContractName::try_from("a".repeat(41)).unwrap(),
+        ));
+        let nft_maybe_sent = TransactionPostCondition::Nonfungible(
+            PostConditionPrincipal::Origin,
+            AssetInfo {
+                contract_address: StacksAddress::new(1, Hash160([0x22; 20])).unwrap(),
+                contract_name: ContractName::from_literal("hello-world"),
+                asset_name: ClarityName::from_literal("asset"),
+            },
+            Value::Int(1),
+            NonfungibleConditionCode::MaybeSent,
+        );
+
+        // (gate name, transaction, expected precheck message prefix, reason fragment expected at Epoch 4.1)
+        let cases: Vec<(&str, StacksTransaction, &str, &str)> = vec![
+            (
+                "originator post-condition mode",
+                sign_testnet_tx_for_gate_test(
+                    transfer(plain_recipient.clone()),
+                    TransactionPostConditionMode::Originator,
+                    vec![],
+                ),
+                "Invalid Stacks transaction: ",
+                "",
+            ),
+            (
+                "NFT MaybeSent",
+                sign_testnet_tx_for_gate_test(
+                    transfer(plain_recipient.clone()),
+                    TransactionPostConditionMode::Allow,
+                    vec![nft_maybe_sent],
+                ),
+                "Invalid Stacks transaction: ",
+                "",
+            ),
+            (
+                "staking post-condition",
+                sign_testnet_tx_for_gate_test(
+                    transfer(plain_recipient.clone()),
+                    TransactionPostConditionMode::Allow,
+                    vec![TransactionPostCondition::Staking(
+                        PostConditionPrincipal::Origin,
+                        FungibleConditionCode::SentEq,
+                        1,
+                    )],
+                ),
+                "Invalid Stacks transaction: ",
+                "",
+            ),
+            (
+                "pox post-condition",
+                sign_testnet_tx_for_gate_test(
+                    transfer(plain_recipient.clone()),
+                    TransactionPostConditionMode::Allow,
+                    vec![TransactionPostCondition::Pox(
+                        PostConditionPrincipal::Origin,
+                        PoxConditionCode::Performed,
+                    )],
+                ),
+                "Invalid Stacks transaction: ",
+                "",
+            ),
+            (
+                "versioned deploy rejected from 4.1",
+                sign_testnet_tx_for_gate_test(
+                    deploy_payload_for_gate_test(Some(ClarityVersion::Clarity6)),
+                    TransactionPostConditionMode::Allow,
+                    vec![],
+                ),
+                "Invalid transaction ",
+                "not accepted since Stacks 4.1",
+            ),
+            (
+                "versioned deploy too new",
+                sign_testnet_tx_for_gate_test(
+                    deploy_payload_for_gate_test(Some(ClarityVersion::Clarity7)),
+                    TransactionPostConditionMode::Allow,
+                    vec![],
+                ),
+                "Invalid transaction ",
+                "",
+            ),
+            (
+                "overlong contract name in token transfer recipient",
+                sign_testnet_tx_for_gate_test(
+                    transfer(overlong_recipient),
+                    TransactionPostConditionMode::Allow,
+                    vec![],
+                ),
+                "Invalid transaction ",
+                "not supported since Stacks 4.1",
+            ),
+        ];
+
+        let epochs = [
+            StacksEpochId::Epoch20,
+            StacksEpochId::Epoch2_05,
+            StacksEpochId::Epoch21,
+            StacksEpochId::Epoch30,
+            StacksEpochId::Epoch33,
+            StacksEpochId::Epoch34,
+            StacksEpochId::Epoch40,
+            StacksEpochId::Epoch41,
+        ];
+        let config = DBConfig {
+            version: CHAINSTATE_VERSION.to_string(),
+            mainnet: false,
+            chain_id: 0x80000000,
+        };
+
+        for (gate, tx, prefix, reason) in cases.iter() {
+            // Versioned deploys are a block-only rejection before 2.1, so skip those epochs for
+            // them here; `precheck_and_static_validation_differ_on_block_only_gates` covers it.
+            let is_versioned_deploy =
+                matches!(tx.payload, TransactionPayload::SmartContract(_, Some(_)));
+            let mut rejected_somewhere = false;
+            for epoch_id in epochs.iter().copied() {
+                if is_versioned_deploy && epoch_id < StacksEpochId::Epoch21 {
+                    continue;
+                }
+                let static_ok = StacksBlock::validate_transaction_static_epoch(tx, epoch_id);
+                let result = TransactionProcessor::from(tx).precheck(&config, epoch_id);
+                assert_eq!(
+                    static_ok,
+                    result.is_ok(),
+                    "gate '{gate}' disagrees at {epoch_id:?}: precheck {result:?}"
+                );
+                if let Err(e) = result {
+                    rejected_somewhere = true;
+                    match e {
+                        Error::InvalidStacksTransaction(msg, false) => {
+                            assert!(msg.starts_with(prefix), "gate '{gate}': {msg}");
+                            // The 4.1 reason text is only expected once 4.1 is active; earlier
+                            // epochs reject the versioned deploy as too new instead.
+                            if epoch_id == StacksEpochId::Epoch41 {
+                                assert!(msg.contains(reason), "gate '{gate}': {msg}");
+                            }
+                        }
+                        e => panic!("gate '{gate}' at {epoch_id:?}: unexpected error {e:?}"),
+                    }
+                }
+            }
+            assert!(rejected_somewhere, "gate '{gate}' never rejected");
+        }
+    }
+
+    /// Gates that only static block validation applies are deliberately absent from the
+    /// precheck: Epoch 2.x microblock transactions get no other per-transaction epoch check.
+    /// A versioned deploy before Epoch 2.1 therefore passes the precheck but fails static block
+    /// validation, and static validation rejects it at Epoch 1.0 without panicking.
+    #[rstest]
+    #[case(StacksEpochId::Epoch10)]
+    #[case(StacksEpochId::Epoch20)]
+    #[case(StacksEpochId::Epoch2_05)]
+    fn precheck_and_static_validation_differ_on_block_only_gates(#[case] epoch_id: StacksEpochId) {
+        let tx = sign_testnet_tx_for_gate_test(
+            deploy_payload_for_gate_test(Some(ClarityVersion::Clarity1)),
+            TransactionPostConditionMode::Allow,
+            vec![],
+        );
+        assert!(!StacksBlock::validate_transaction_static_epoch(
+            &tx, epoch_id
+        ));
+
+        // Precheck would reach the versioned-deploy check, which panics at Epoch 1.0, so only
+        // compare the epochs where Clarity exists.
+        if epoch_id >= StacksEpochId::Epoch20 {
+            let config = DBConfig {
+                version: CHAINSTATE_VERSION.to_string(),
+                mainnet: false,
+                chain_id: 0x80000000,
+            };
+            TransactionProcessor::from(&tx)
+                .precheck(&config, epoch_id)
+                .unwrap();
+        }
+    }
+
     #[rstest]
     #[case(StacksEpochId::Epoch30, false)]
     #[case(StacksEpochId::Epoch31, false)]

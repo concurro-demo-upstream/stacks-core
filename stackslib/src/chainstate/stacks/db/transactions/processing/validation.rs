@@ -23,6 +23,17 @@ use crate::chainstate::stacks::{
 use crate::core::StacksEpochId;
 
 /// Pre-check a transaction -- make sure it's well-formed.
+///
+/// Besides the epoch gates in [`check_transaction_epoch_gates`], this checks what only applies
+/// when a single transaction is admitted or processed on its own:
+/// - the auth mode is supported in `epoch_id`;
+/// - the signatures verify (high-S signatures are only allowed in some epochs);
+/// - the chain ID and mainnet/testnet version match `config`.
+///
+/// Static block validation ([`crate::chainstate::stacks::StacksBlock::validate_transaction_static_epoch`])
+/// additionally gates coinbase, pre-2.1 versioned deploys and `TenureChange` payloads. Those gates
+/// are deliberately not applied here: Epoch 2.x microblock transactions get no other per-transaction
+/// epoch check, so adding them here could change which historical transactions are accepted.
 pub fn precheck_transaction(
     config: &DBConfig,
     tx: &StacksTransaction,
@@ -78,40 +89,53 @@ pub fn precheck_transaction(
         }
     }
 
+    // The remaining epoch gates are shared with static block validation.
+    check_transaction_epoch_gates(tx, epoch_id).map_err(|msg| {
+        info!("{msg}"; "txid" => %tx.txid());
+        Error::InvalidStacksTransaction(msg, false)
+    })?;
+
+    Ok(())
+}
+
+/// Epoch gates on transaction content that both [`precheck_transaction`] and static block
+/// validation apply. New content gates that must hold on both paths belong here.
+///
+/// Checks, in order: post-condition support, versioned-deploy support (only for
+/// `SmartContract(_, Some(_))`) and contract-name support.
+///
+/// # Errors
+///
+/// Returns the message to report: `"Invalid Stacks transaction: {reason}"` for post-conditions,
+/// and `"Invalid transaction {txid}: {reason}"` for versioned deploys and contract names.
+///
+/// # Panics
+///
+/// A versioned deploy reaches `check_versioned_deploy_supported_in_epoch`, which panics at
+/// Epoch 1.0 (no Clarity exists there). Callers must reject versioned deploys before Epoch 2.1
+/// first, or only pass epochs where Clarity exists.
+pub(crate) fn check_transaction_epoch_gates(
+    tx: &StacksTransaction,
+    epoch_id: StacksEpochId,
+) -> Result<(), String> {
     stacks_transactions::check_post_conditions_supported_in_epoch(
         &tx.post_conditions,
         &tx.post_condition_mode,
         epoch_id,
     )
-    .map_err(|reason| {
-        let msg = format!("Invalid Stacks transaction: {reason}");
-        info!("{}", &msg; "txid" => %tx.txid());
-        Error::InvalidStacksTransaction(msg, false)
-    })?;
+    .map_err(|reason| format!("Invalid Stacks transaction: {reason}"))?;
 
-    // Same rule as static block validation, so a block that would fail
-    // here is never staged.
     if let TransactionPayload::SmartContract(_, Some(clarity_version)) = &tx.payload {
         stacks_transactions::check_versioned_deploy_supported_in_epoch(*clarity_version, epoch_id)
-            .map_err(|reason| {
-                let msg = format!("Invalid transaction {}: {reason}", tx.txid());
-                info!("{msg}");
-                Error::InvalidStacksTransaction(msg, false)
-            })?;
+            .map_err(|reason| format!("Invalid transaction {}: {reason}", tx.txid()))?;
     }
 
-    // Same rule as static block validation, so a block that would fail
-    // there is never mined or staged.
     stacks_transactions::check_contract_names_supported_in_epoch(
         &tx.payload,
         &tx.post_conditions,
         epoch_id,
     )
-    .map_err(|reason| {
-        let msg = format!("Invalid transaction {}: {reason}", tx.txid());
-        info!("{msg}");
-        Error::InvalidStacksTransaction(msg, false)
-    })?;
+    .map_err(|reason| format!("Invalid transaction {}: {reason}", tx.txid()))?;
 
     Ok(())
 }

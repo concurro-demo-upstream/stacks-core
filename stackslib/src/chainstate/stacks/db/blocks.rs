@@ -6628,7 +6628,9 @@ impl StacksChainState {
             ));
         }
 
-        // 4: check if transaction is valid in the current epoch
+        // 4: check if transaction is valid in the current epoch.
+        // Precheck already applied the shared epoch gates; this call is kept for the block-only
+        // gates (coinbase, pre-2.1 versioned deploys, TenureChange).
         if !StacksBlock::validate_transaction_static_epoch(tx, epoch) {
             return Err(MemPoolRejection::Other(
                 "Transaction is not supported in this epoch".to_string(),
