@@ -22,9 +22,10 @@ use clarity::vm::ClarityName;
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::Address;
 
-use super::test_rpc;
+use super::{assert_squashed_proof_error, test_rpc, TestRPC};
 use crate::net::api::*;
 use crate::net::connection::ConnectionOptions;
+use crate::net::http::HttpRequestContents;
 use crate::net::httpcore::{
     HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttp, StacksHttpRequest,
 };
@@ -178,5 +179,55 @@ fn test_try_make_response() {
     );
 
     let (preamble, body) = response.destruct();
+    assert_eq!(preamble.status_code, 404);
+}
+
+/// Proof reads on a squashed Clarity MARF must fail with an explicit error instead of a
+/// misleading 404. Reads without proofs keep working on squashed state.
+#[test]
+fn test_try_make_response_squashed() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
+    let mut test = TestRPC::setup(function_name!());
+    test.squash_serving_clarity_state();
+    let tip = TipRequest::SpecificTip(test.canonical_tip.clone());
+
+    let data_var = |name: &str, with_proof: bool| {
+        StacksHttpRequest::new_getdatavar(
+            addr.into(),
+            StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap(),
+            "hello-world".try_into().unwrap(),
+            name.try_into().unwrap(),
+            tip.clone(),
+            with_proof,
+        )
+    };
+
+    let requests = vec![
+        // default proof (proofs are returned unless the client opts out)
+        StacksHttpRequest::new_for_peer(
+            addr.into(),
+            "GET".into(),
+            "/v2/data_var/ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R/hello-world/bar".into(),
+            HttpRequestContents::new().for_tip(tip.clone()),
+        )
+        .unwrap(),
+        // explicit proof=1, existing and missing vars
+        data_var("bar", true),
+        data_var("does-not-exist", true),
+        // proof=0 still reads the stored value, and 404s for a missing var
+        data_var("bar", false),
+        data_var("does-not-exist", false),
+    ];
+    let mut responses = test.run(requests);
+
+    for _ in 0..3 {
+        assert_squashed_proof_error(responses.remove(0));
+    }
+
+    let resp = responses.remove(0).decode_data_var_response().unwrap();
+    assert_eq!(resp.data, "0x0000000000000000000000000000000000");
+    assert!(resp.marf_proof.is_none());
+
+    let (preamble, _) = responses.remove(0).destruct();
     assert_eq!(preamble.status_code, 404);
 }

@@ -17,6 +17,7 @@
 use clarity::vm::ast::parser::v1::CLARITY_NAME_REGEX;
 use clarity::vm::clarity::ClarityConnection;
 use clarity::vm::database::ClarityDatabase;
+use clarity::vm::errors::VmExecutionError;
 use clarity::vm::representations::{CONTRACT_NAME_REGEX_STRING, STANDARD_PRINCIPAL_REGEX_STRING};
 use clarity::vm::types::{QualifiedContractIdentifier, BOUND_VALUE_SERIALIZATION_HEX};
 use clarity::vm::{ClarityName, ContractName, Value};
@@ -29,7 +30,7 @@ use crate::net::api::read_only::parse::parse_map_key_body;
 use crate::net::http::{
     parse_json, Error, HttpContentType, HttpNotFound, HttpRequest, HttpRequestContents,
     HttpRequestPreamble, HttpResponse, HttpResponseContents, HttpResponsePayload,
-    HttpResponsePreamble,
+    HttpResponsePreamble, HttpServerError,
 };
 use crate::net::httpcore::{
     request, HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttpRequest,
@@ -170,37 +171,48 @@ impl RPCRequestHandler for RPCGetMapEntryRequestHandler {
                     &tip,
                     |clarity_tx| {
                         clarity_tx.with_clarity_db_readonly(|clarity_db| {
+                            // A missing key yields `Ok(None)` and takes the default; any other
+                            // failure (e.g. proofs on a squashed MARF) is propagated.
                             let (value_hex, marf_proof): (String, _) = if with_proof {
-                                clarity_db
-                                    .get_data_with_proof(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|(a, b)| (a, Some(format!("0x{}", to_hex(&b)))))
-                                    .unwrap_or_else(|| {
+                                match clarity_db.get_data_with_proof(&key)? {
+                                    Some((a, b)) => (a, Some(format!("0x{}", to_hex(&b)))),
+                                    None => {
                                         test_debug!("No value for '{}' in {}", &key, tip);
                                         (none_response, Some("".into()))
-                                    })
+                                    }
+                                }
                             } else {
-                                clarity_db
-                                    .get_data(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|a| (a, None))
-                                    .unwrap_or_else(|| {
+                                match clarity_db.get_data(&key)? {
+                                    Some(a) => (a, None),
+                                    None => {
                                         test_debug!("No value for '{}' in {}", &key, tip);
                                         (none_response, None)
-                                    })
+                                    }
+                                }
                             };
 
                             let data = format!("0x{}", value_hex);
-                            MapEntryResponse { data, marf_proof }
+                            Ok::<_, VmExecutionError>(MapEntryResponse { data, marf_proof })
                         })
                     },
                 )
             });
 
         let data_resp = match data_resp {
-            Ok(Some(data)) => data,
+            Ok(Some(Ok(data))) => data,
+            Ok(Some(Err(e))) => {
+                warn!("Failed to read map entry";
+                    "tip" => %tip,
+                    "key" => &key,
+                    "with_proof" => with_proof,
+                    "err" => %e
+                );
+                return StacksHttpResponse::new_error(
+                    &preamble,
+                    &HttpServerError::new(format!("Failed to read map entry: {e}")),
+                )
+                .try_into_contents();
+            }
             Ok(None) | Err(_) => {
                 return StacksHttpResponse::new_error(
                     &preamble,

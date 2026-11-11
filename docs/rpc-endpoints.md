@@ -155,6 +155,10 @@ object with balance and nonce of 0.
 This endpoint also accepts a query string parameter `?proof=` which when supplied `0`, will return the
 JSON object _without_ the `balance_proof` or `nonce_proof` fields.
 
+On a node booted from a squashed (Pruned Chainstate Snapshot) chainstate, MARF proofs are not
+available: a request with `proof=1` (the default) returns HTTP 500 with a `text/plain` body naming
+the squashed MARF, rather than default values. Use `?proof=0` to read from such a node.
+
 This endpoint accepts a query string parameter `?tip=` to control which chain tip state is queried.
 See the [OpenAPI spec](./rpc/openapi.yaml) `tip` parameter for details.
 
@@ -179,6 +183,10 @@ Where data is the hex serialization of the variable value.
 
 This endpoint also accepts a query string parameter `?proof=` which when supplied `0`, will return the
 JSON object _without_ the `proof` field.
+
+On a node booted from a squashed (Pruned Chainstate Snapshot) chainstate, MARF proofs are not
+available: a request with `proof=1` (the default) returns HTTP 500 with a `text/plain` body naming
+the squashed MARF, rather than default values. Use `?proof=0` to read from such a node.
 
 ### GET /v2/clarity/marf/[Clarity MARF Key]
 Attempt to fetch the value of a MARF key. The key is identified with [Clarity MARF Key].
@@ -259,6 +267,10 @@ object.
 
 This endpoint also accepts a query string parameter `?proof=` which when supplied `0`, will return the
 JSON object _without_ the `proof` field.
+
+On a node booted from a squashed (Pruned Chainstate Snapshot) chainstate, MARF proofs are not
+available: a request with `proof=1` (the default) returns HTTP 500 with a `text/plain` body naming
+the squashed MARF, rather than default values. Use `?proof=0` to read from such a node.
 
 ### GET /v2/fees/transfer
 

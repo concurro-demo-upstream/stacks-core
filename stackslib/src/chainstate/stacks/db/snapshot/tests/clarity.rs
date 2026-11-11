@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use clarity::vm::database::clarity_store::make_contract_hash_key;
 use clarity::vm::database::{ClarityBackingStore, MetadataRow, SqliteConnection};
+use clarity::vm::errors::{VmExecutionError, VmInternalError};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_marf::marf::{MARFOpenOpts, MARF};
@@ -538,4 +539,77 @@ fn test_unclassified_source_table_is_rejected() {
         !dst_db.exists(),
         "no destination should be produced when the source is rejected"
     );
+}
+
+/// On a squashed Clarity MARF, both proof getters fail with a `MarfFailure` that names the squash
+/// instead of the opaque "Unexpected MARF Failure on GET", while plain reads still work.
+#[test]
+fn test_squashed_clarity_marf_proof_reads_report_squash() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+
+    squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
+
+    let squashed_dir = dir.path().join("squashed");
+    let mut kv = MarfedKV::open(squashed_dir.to_str().unwrap(), Some(&blocks[3]), None).unwrap();
+    let mut store = kv.begin_read_only(Some(&blocks[3]));
+
+    // Existing and missing keys alike fail: the squashed MARF rejects proofs before any lookup.
+    for key in ["clarity_key_1", "no_such_key"] {
+        let err = store
+            .get_data_with_proof(key)
+            .expect_err("proofs are unsupported on a squashed MARF");
+        match err {
+            VmExecutionError::Internal(VmInternalError::MarfFailure(msg)) => assert!(
+                msg.contains("not supported on a squashed MARF"),
+                "error should name the squash, got: {msg}"
+            ),
+            other => panic!("expected MarfFailure, got {other:?}"),
+        }
+    }
+
+    let hash = TrieHash::from_key("clarity_key_1");
+    match store.get_data_with_proof_from_path(&hash) {
+        Err(VmExecutionError::Internal(VmInternalError::MarfFailure(msg))) => assert!(
+            msg.contains("not supported on a squashed MARF"),
+            "error should name the squash, got: {msg}"
+        ),
+        other => panic!("expected MarfFailure, got {other:?}"),
+    }
+
+    assert_eq!(
+        store.get_data("clarity_key_1").unwrap().as_deref(),
+        Some("clarity_val_1_at_3")
+    );
+}
+
+/// Control for the squashed test above: on an archival Clarity MARF an existing key yields a
+/// non-empty proof, and a missing key is `Ok(None)` rather than an error.
+#[test]
+fn test_archival_clarity_marf_proof_reads() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+
+    let mut kv = MarfedKV::open(src_dir.to_str().unwrap(), Some(&blocks[3]), None).unwrap();
+    let mut store = kv.begin_read_only(Some(&blocks[3]));
+
+    let (value, proof) = store
+        .get_data_with_proof("clarity_key_1")
+        .unwrap()
+        .expect("existing key should have a proof");
+    assert_eq!(value, "clarity_val_1_at_3");
+    assert!(!proof.is_empty());
+
+    assert!(store.get_data_with_proof("no_such_key").unwrap().is_none());
+    assert!(store
+        .get_data_with_proof_from_path(&TrieHash::from_key("no_such_key"))
+        .unwrap()
+        .is_none());
 }

@@ -1,0 +1,1 @@
+Proof reads (`proof=1`, the default) through `/v2/accounts`, `/v2/map_entry` and `/v2/data_var` on a squashed (PCS) chainstate now return an HTTP 500 error naming the squashed MARF instead of silently returning default values.

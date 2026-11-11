@@ -24,7 +24,7 @@ use stacks_common::util::hash::to_hex;
 
 use crate::net::http::{
     parse_json, Error, HttpNotFound, HttpRequest, HttpRequestContents, HttpRequestPreamble,
-    HttpResponse, HttpResponseContents, HttpResponsePayload, HttpResponsePreamble,
+    HttpResponse, HttpResponseContents, HttpResponsePayload, HttpResponsePreamble, HttpServerError,
 };
 use crate::net::httpcore::{
     HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttpRequest, StacksHttpResponse,
@@ -128,6 +128,7 @@ impl RPCRequestHandler for RPCGetAccountRequestHandler {
             .take()
             .ok_or(NetError::SendError("Missing `account`".into()))?;
         let with_proof = contents.get_with_proof();
+        let account_principal = account.clone();
 
         let account_opt_res =
             node.with_node_state(|_network, sortdb, chainstate, _mempool, _rpc_args| {
@@ -143,37 +144,35 @@ impl RPCRequestHandler for RPCGetAccountRequestHandler {
                             let v2_unlock_height = clarity_db.get_v2_unlock_height().ok()?;
                             let v3_unlock_height = clarity_db.get_v3_unlock_height().ok()?;
                             let v4_unlock_height = clarity_db.get_v4_unlock_height().ok()?;
+                            // A missing key yields `Ok(None)` and takes the default; any other
+                            // failure (e.g. proofs on a squashed MARF) is propagated.
                             let (balance, balance_proof) = if with_proof {
-                                clarity_db
-                                    .get_data_with_proof::<STXBalance>(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|(a, b)| (a, Some(format!("0x{}", to_hex(&b)))))
-                                    .unwrap_or_else(|| (STXBalance::zero(), Some("".into())))
+                                match clarity_db.get_data_with_proof::<STXBalance>(&key) {
+                                    Ok(Some((a, b))) => (a, Some(format!("0x{}", to_hex(&b)))),
+                                    Ok(None) => (STXBalance::zero(), Some("".into())),
+                                    Err(e) => return Some(Err(e)),
+                                }
                             } else {
-                                clarity_db
-                                    .get_data::<STXBalance>(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|a| (a, None))
-                                    .unwrap_or_else(|| (STXBalance::zero(), None))
+                                match clarity_db.get_data::<STXBalance>(&key) {
+                                    Ok(Some(a)) => (a, None),
+                                    Ok(None) => (STXBalance::zero(), None),
+                                    Err(e) => return Some(Err(e)),
+                                }
                             };
 
                             let key = ClarityDatabase::make_key_for_account_nonce(&account);
                             let (nonce, nonce_proof) = if with_proof {
-                                clarity_db
-                                    .get_data_with_proof(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|(a, b)| (a, Some(format!("0x{}", to_hex(&b)))))
-                                    .unwrap_or_else(|| (0, Some("".into())))
+                                match clarity_db.get_data_with_proof(&key) {
+                                    Ok(Some((a, b))) => (a, Some(format!("0x{}", to_hex(&b)))),
+                                    Ok(None) => (0, Some("".into())),
+                                    Err(e) => return Some(Err(e)),
+                                }
                             } else {
-                                clarity_db
-                                    .get_data(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|a| (a, None))
-                                    .unwrap_or_else(|| (0, None))
+                                match clarity_db.get_data(&key) {
+                                    Ok(Some(a)) => (a, None),
+                                    Ok(None) => (0, None),
+                                    Err(e) => return Some(Err(e)),
+                                }
                             };
 
                             let unlocked = balance
@@ -197,27 +196,41 @@ impl RPCRequestHandler for RPCGetAccountRequestHandler {
                             let balance = format!("0x{}", to_hex(&unlocked.to_be_bytes()));
                             let locked = format!("0x{}", to_hex(&locked.to_be_bytes()));
 
-                            Some(AccountEntryResponse {
+                            Some(Ok(AccountEntryResponse {
                                 balance,
                                 locked,
                                 unlock_height,
                                 nonce,
                                 balance_proof,
                                 nonce_proof,
-                            })
+                            }))
                         })
                     },
                 )
             });
 
-        let account = if let Ok(Some(account)) = account_opt_res {
-            account
-        } else {
-            return StacksHttpResponse::new_error(
-                &preamble,
-                &HttpNotFound::new(format!("Chain tip '{}' not found", &tip)),
-            )
-            .try_into_contents();
+        let account = match account_opt_res {
+            Ok(Some(Some(Ok(account)))) => account,
+            Ok(Some(Some(Err(e)))) => {
+                warn!("Failed to read account";
+                    "tip" => %tip,
+                    "principal" => %account_principal,
+                    "with_proof" => with_proof,
+                    "err" => %e
+                );
+                return StacksHttpResponse::new_error(
+                    &preamble,
+                    &HttpServerError::new(format!("Failed to read account: {e}")),
+                )
+                .try_into_contents();
+            }
+            Ok(Some(None)) | Ok(None) | Err(_) => {
+                return StacksHttpResponse::new_error(
+                    &preamble,
+                    &HttpNotFound::new(format!("Chain tip '{}' not found", &tip)),
+                )
+                .try_into_contents();
+            }
         };
 
         let preamble = HttpResponsePreamble::ok_json(&preamble);

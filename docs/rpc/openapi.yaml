@@ -328,6 +328,11 @@ paths:
           (some ...) object.
         - `proof`: The hex serialization of the Merkle proof for the data.
 
+        On a node booted from a squashed (Pruned Chainstate Snapshot) chainstate, MARF
+        proofs are not available: a request with `proof=1` (the default) fails with an HTTP 500
+        `text/plain` error naming the squashed MARF, rather than returning default values.
+        Use `proof=0` to read from such a node.
+
       parameters:
         - $ref: ./components/parameters/deployer-address.yaml
         - $ref: ./components/parameters/contract-name.yaml
@@ -528,6 +533,11 @@ paths:
         Where balance is the hex encoding of a unsigned 128-bit integer (big-endian), nonce is a unsigned 64-bit integer, and the proofs are provided as hex strings.
 
         For non-existent accounts, this does not 404, rather it returns an object with balance and nonce of 0.
+
+        On a node booted from a squashed (Pruned Chainstate Snapshot) chainstate, MARF
+        proofs are not available: a request with `proof=1` (the default) fails with an HTTP 500
+        `text/plain` error naming the squashed MARF, rather than returning default values.
+        Use `proof=0` to read from such a node.
 
         Under PoX-5, `unstake` keeps the amount locked and moves `unlock_height` to the first Bitcoin block of the next reward cycle. STX paired with a protocol bond stays locked until the bond ends. When the burn block height of the queried tip reaches `unlock_height`, the amount moves into `balance` with no transaction.
       parameters:
@@ -2008,6 +2018,11 @@ paths:
       description: |
         Fetch a data variable from a smart contract.
         Returns the raw hex-encoded value of the variable.
+
+        On a node booted from a squashed (Pruned Chainstate Snapshot) chainstate, MARF
+        proofs are not available: a request with `proof=1` (the default) fails with an HTTP 500
+        `text/plain` error naming the squashed MARF, rather than returning default values.
+        Use `proof=0` to read from such a node.
       parameters:
         - $ref: ./components/parameters/standard-principal.yaml
         - $ref: ./components/parameters/contract-name.yaml
@@ -2033,6 +2048,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /v2/headers/{quantity}:
     get:

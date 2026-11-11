@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,11 +36,14 @@ use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{to_hex, Hash160, Sha512Trunc256Sum};
 use stacks_common::util::pipe::Pipe;
 use stacks_common::util::serde_serializers::{prefix_hex, prefix_opt_hex};
+use stacks_marf::marf::{MARFOpenOpts, MARF};
+use stacks_marf::storage::TrieHashCalculationMode;
 
 use crate::burnchains::bitcoin::indexer::BitcoinIndexer;
 use crate::burnchains::Txid;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::nakamoto::NakamotoChainState;
+use crate::chainstate::stacks::db::snapshot::copy_clarity_side_tables;
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::miner::{BlockBuilderSettings, StacksMicroblockBuilder};
 use crate::chainstate::stacks::{
@@ -47,8 +51,11 @@ use crate::chainstate::stacks::{
     StacksTransaction, StacksTransactionSigner, TokenTransferMemo, TransactionAnchorMode,
     TransactionAuth, TransactionPayload, TransactionPostConditionMode, TransactionVersion,
 };
+use crate::clarity_vm::clarity::ClarityInstance;
+use crate::clarity_vm::database::marf::MarfedKV;
 use crate::core::MemPoolDB;
 use crate::net::db::PeerDB;
+use crate::net::http::{HttpContentType, HttpResponsePayload};
 use crate::net::httpcore::{
     HttpPreambleExtensions as _, StacksHttpRequest, StacksHttpResponse, TipRequest,
 };
@@ -1129,6 +1136,62 @@ impl<'a> TestRPC<'a> {
         }
     }
 
+    /// Replace the serving peer's (peer 2) Clarity MARF with a squashed copy taken at
+    /// `self.canonical_tip`, mimicking a node booted from a Pruned Chainstate Snapshot.
+    ///
+    /// The squash uses the same `MARF::squash_to_path` + `copy_clarity_side_tables` path as
+    /// `marf-squash`. Only the Clarity MARF is squashed; the headers index stays archival, since
+    /// that is all the proof-capable read endpoints need. Unconfirmed state is disabled so that
+    /// reads are served from the anchored tip.
+    pub fn squash_serving_clarity_state(&mut self) {
+        self.unconfirmed_state = false;
+
+        let tip = self.canonical_tip.clone();
+        let chainstate = &mut self
+            .peer_2
+            .chain
+            .stacks_node
+            .as_mut()
+            .expect("FATAL: no stacks node")
+            .chainstate;
+        chainstate.unconfirmed_state = None;
+
+        let src_db_path = chainstate.clarity_state_index_path.clone();
+        let src_root = PathBuf::from(&chainstate.clarity_state_index_root);
+        let dst_root = src_root.with_file_name(format!(
+            "{}-squashed",
+            src_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&dst_root).unwrap();
+        let dst_db_path = dst_root.join("marf.sqlite");
+        let dst_db_path = dst_db_path.to_str().unwrap();
+
+        // The Clarity MARF is opened with external blobs (see `MarfedKV::open`).
+        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, true);
+        let squash_height = {
+            let mut marf =
+                MARF::<StacksBlockId>::from_path(&src_db_path, open_opts.clone()).unwrap();
+            marf.get_block_height_of(&tip, &tip)
+                .unwrap()
+                .expect("FATAL: canonical tip missing from Clarity MARF")
+        };
+
+        MARF::<StacksBlockId>::squash_to_path(
+            &src_db_path,
+            dst_db_path,
+            open_opts,
+            &tip,
+            squash_height,
+            "test",
+        )
+        .unwrap();
+        copy_clarity_side_tables(&src_db_path, dst_db_path).unwrap();
+
+        let kv = MarfedKV::open(dst_root.to_str().unwrap(), Some(&tip), None).unwrap();
+        chainstate.clarity_state =
+            ClarityInstance::new(chainstate.mainnet, chainstate.chain_id, kv);
+    }
+
     pub fn run(self, requests: Vec<StacksHttpRequest>) -> Vec<StacksHttpResponse> {
         self.run_with_observer(requests, None, |_, _| true)
     }
@@ -1338,6 +1401,21 @@ impl<'a> TestRPC<'a> {
 
         responses
     }
+}
+
+/// Assert that `response` is the error returned for a proof read on a squashed MARF: HTTP 500,
+/// `text/plain`, with a body that names the squash as the cause.
+pub fn assert_squashed_proof_error(response: StacksHttpResponse) {
+    let (preamble, body) = response.destruct();
+    assert_eq!(preamble.status_code, 500);
+    assert_eq!(preamble.content_type, HttpContentType::Text);
+    let HttpResponsePayload::Text(msg) = body else {
+        panic!("expected text body, got {body:?}");
+    };
+    assert!(
+        msg.contains("not supported on a squashed MARF"),
+        "unexpected error body: {msg}"
+    );
 }
 
 /// General testing function to test RPC calls.

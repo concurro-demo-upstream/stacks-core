@@ -22,7 +22,7 @@ use clarity::vm::{ClarityName, Value};
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::Address;
 
-use super::{bool_list_hex, test_rpc};
+use super::{assert_squashed_proof_error, bool_list_hex, test_rpc, TestRPC};
 use crate::net::api::*;
 use crate::net::connection::ConnectionOptions;
 use crate::net::http::HttpRequestContents;
@@ -311,4 +311,66 @@ fn test_try_make_response() {
     );
     // `with_proof = false`, so no MARF proof is returned
     assert_eq!(resp.marf_proof, None);
+}
+
+/// Proof reads on a squashed Clarity MARF must fail with an explicit error instead of
+/// returning `none`. Reads without proofs keep working on squashed state.
+#[test]
+fn test_try_make_response_squashed() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
+    let mut test = TestRPC::setup(function_name!());
+    test.squash_serving_clarity_state();
+    let tip = TipRequest::SpecificTip(test.canonical_tip.clone());
+
+    let map_entry = |key: u128, with_proof: bool| {
+        StacksHttpRequest::new_getmapentry(
+            addr.into(),
+            StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap(),
+            "hello-world".try_into().unwrap(),
+            "test-map".try_into().unwrap(),
+            Value::UInt(key),
+            tip.clone(),
+            with_proof,
+        )
+    };
+
+    let requests = vec![
+        // default proof (proofs are returned unless the client opts out)
+        StacksHttpRequest::new_for_peer(
+            addr.into(),
+            "POST".into(),
+            "/v2/map_entry/ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R/hello-world/test-map".into(),
+            HttpRequestContents::new()
+                .for_tip(tip.clone())
+                .payload_json(serde_json::Value::String(
+                    Value::UInt(1).serialize_to_hex().unwrap(),
+                )),
+        )
+        .unwrap(),
+        // explicit proof=1, existing and missing keys
+        map_entry(1, true),
+        map_entry(100, true),
+        // proof=0 still reads the stored value, and `none` for a missing key
+        map_entry(1, false),
+        map_entry(100, false),
+    ];
+    let mut responses = test.run(requests);
+
+    for _ in 0..3 {
+        assert_squashed_proof_error(responses.remove(0));
+    }
+
+    let resp = responses.remove(0).decode_map_entry_response().unwrap();
+    assert_ne!(
+        resp.data,
+        format!("0x{}", Value::none().serialize_to_hex().unwrap())
+    );
+    assert!(resp.marf_proof.is_none());
+
+    let resp = responses.remove(0).decode_map_entry_response().unwrap();
+    assert_eq!(
+        resp.data,
+        format!("0x{}", Value::none().serialize_to_hex().unwrap())
+    );
+    assert!(resp.marf_proof.is_none());
 }

@@ -622,6 +622,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             .expect("Attempted to get the open chain tip from an unopened context.")
     }
 
+    /// Reads `key` and returns its value along with a MARF proof.
+    ///
+    /// # Errors
+    ///
+    /// - `MarfFailure` carrying the underlying MARF error for any failure other than a missing
+    ///   key (which yields `Ok(None)`), e.g. proofs requested on a squashed MARF.
     fn get_data_with_proof(
         &mut self,
         key: &str,
@@ -632,7 +638,7 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| VmInternalError::MarfFailure(e.to_string()))?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -647,6 +653,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             .transpose()
     }
 
+    /// Reads the value at `hash` and returns it along with a MARF proof.
+    ///
+    /// # Errors
+    ///
+    /// - `MarfFailure` carrying the underlying MARF error for any failure other than a missing
+    ///   key (which yields `Ok(None)`), e.g. proofs requested on a squashed MARF.
     fn get_data_with_proof_from_path(
         &mut self,
         hash: &TrieHash,
@@ -657,7 +669,7 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| VmInternalError::MarfFailure(e.to_string()))?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -885,6 +897,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             .transpose()
     }
 
+    /// Reads `key` and returns its value along with a MARF proof.
+    ///
+    /// # Errors
+    ///
+    /// - `MarfFailure` carrying the underlying MARF error for any failure other than a missing
+    ///   key (which yields `Ok(None)`), e.g. proofs requested on a squashed MARF.
     fn get_data_with_proof(
         &mut self,
         key: &str,
@@ -895,7 +913,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| VmInternalError::MarfFailure(e.to_string()))?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -910,6 +928,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             .transpose()
     }
 
+    /// Reads the value at `hash` and returns it along with a MARF proof.
+    ///
+    /// # Errors
+    ///
+    /// - `MarfFailure` carrying the underlying MARF error for any failure other than a missing
+    ///   key (which yields `Ok(None)`), e.g. proofs requested on a squashed MARF.
     fn get_data_with_proof_from_path(
         &mut self,
         hash: &TrieHash,
@@ -920,7 +944,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| VmInternalError::MarfFailure(e.to_string()))?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =

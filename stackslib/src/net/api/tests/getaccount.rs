@@ -20,7 +20,7 @@ use clarity::vm::types::{PrincipalData, StacksAddressExtensions};
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::Address;
 
-use super::test_rpc;
+use super::{assert_squashed_proof_error, test_rpc, TestRPC};
 use crate::net::api::*;
 use crate::net::connection::ConnectionOptions;
 use crate::net::http::HttpRequestContents;
@@ -220,4 +220,56 @@ fn test_try_make_response() {
     assert_eq!(resp.nonce, 4);
     assert!(resp.balance_proof.is_some());
     assert!(resp.nonce_proof.is_some());
+}
+
+/// Proof reads on a squashed Clarity MARF must fail with an explicit error instead of
+/// substituting a zero balance and nonce. Reads without proofs keep working on squashed state.
+#[test]
+fn test_try_make_response_squashed() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
+    let mut test = TestRPC::setup(function_name!());
+    test.squash_serving_clarity_state();
+    let tip = TipRequest::SpecificTip(test.canonical_tip.clone());
+
+    let existing = StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R")
+        .unwrap()
+        .to_account_principal();
+    let missing = StacksAddress::from_string("ST165ZBV86V4NJ0V73F52YZGBMJ0FZAQ1BM43C553")
+        .unwrap()
+        .to_account_principal();
+
+    let requests = vec![
+        // default proof (proofs are returned unless the client opts out)
+        StacksHttpRequest::new_for_peer(
+            addr.into(),
+            "GET".into(),
+            format!("/v2/accounts/{existing}"),
+            HttpRequestContents::new().for_tip(tip.clone()),
+        )
+        .unwrap(),
+        // explicit proof=1, existing and missing accounts
+        StacksHttpRequest::new_getaccount(addr.into(), existing.clone(), tip.clone(), true),
+        StacksHttpRequest::new_getaccount(addr.into(), missing.clone(), tip.clone(), true),
+        // proof=0 still reads stored values, and defaults for a missing account
+        StacksHttpRequest::new_getaccount(addr.into(), existing, tip.clone(), false),
+        StacksHttpRequest::new_getaccount(addr.into(), missing, tip, false),
+    ];
+    let mut responses = test.run(requests);
+
+    for _ in 0..3 {
+        assert_squashed_proof_error(responses.remove(0));
+    }
+
+    let resp = responses.remove(0).decode_account_entry_response().unwrap();
+    assert_eq!(resp.balance, "0x0000000000000000000000003b9aca00");
+    assert_eq!(resp.locked, "0x00000000000000000000000000000000");
+    assert_eq!(resp.nonce, 2);
+    assert!(resp.balance_proof.is_none());
+    assert!(resp.nonce_proof.is_none());
+
+    let resp = responses.remove(0).decode_account_entry_response().unwrap();
+    assert_eq!(resp.balance, "0x00000000000000000000000000000000");
+    assert_eq!(resp.nonce, 0);
+    assert!(resp.balance_proof.is_none());
+    assert!(resp.nonce_proof.is_none());
 }

@@ -17,6 +17,7 @@
 use clarity::vm::ast::parser::v1::CLARITY_NAME_REGEX;
 use clarity::vm::clarity::ClarityConnection;
 use clarity::vm::database::{ClarityDatabase, StoreType};
+use clarity::vm::errors::VmExecutionError;
 use clarity::vm::representations::{CONTRACT_NAME_REGEX_STRING, STANDARD_PRINCIPAL_REGEX_STRING};
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::{ClarityName, ContractName};
@@ -27,7 +28,7 @@ use stacks_common::util::hash::to_hex;
 
 use crate::net::http::{
     parse_json, Error, HttpNotFound, HttpRequest, HttpRequestContents, HttpRequestPreamble,
-    HttpResponse, HttpResponseContents, HttpResponsePayload, HttpResponsePreamble,
+    HttpResponse, HttpResponseContents, HttpResponsePayload, HttpResponsePreamble, HttpServerError,
 };
 use crate::net::httpcore::{
     request, HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttpRequest,
@@ -145,30 +146,43 @@ impl RPCRequestHandler for RPCGetDataVarRequestHandler {
                 &tip,
                 |clarity_tx| {
                     clarity_tx.with_clarity_db_readonly(|clarity_db| {
+                        // A missing key yields `Ok(None)` and a 404; any other failure
+                        // (e.g. proofs on a squashed MARF) is propagated.
                         let (value_hex, marf_proof): (String, _) = if with_proof {
-                            clarity_db
-                                .get_data_with_proof(&key)
-                                .ok()
-                                .flatten()
-                                .map(|(a, b)| (a, Some(format!("0x{}", to_hex(&b)))))?
+                            match clarity_db.get_data_with_proof(&key)? {
+                                Some((a, b)) => (a, Some(format!("0x{}", to_hex(&b)))),
+                                None => return Ok(None),
+                            }
                         } else {
-                            clarity_db
-                                .get_data(&key)
-                                .ok()
-                                .flatten()
-                                .map(|a| (a, None))?
+                            match clarity_db.get_data(&key)? {
+                                Some(a) => (a, None),
+                                None => return Ok(None),
+                            }
                         };
 
                         let data = format!("0x{}", value_hex);
-                        Some(DataVarResponse { data, marf_proof })
+                        Ok::<_, VmExecutionError>(Some(DataVarResponse { data, marf_proof }))
                     })
                 },
             )
         });
 
         let data_resp = match data_opt {
-            Ok(Some(Some(data))) => data,
-            Ok(Some(None)) => {
+            Ok(Some(Ok(Some(data)))) => data,
+            Ok(Some(Err(e))) => {
+                warn!("Failed to read data var";
+                    "tip" => %tip,
+                    "key" => &key,
+                    "with_proof" => with_proof,
+                    "err" => %e
+                );
+                return StacksHttpResponse::new_error(
+                    &preamble,
+                    &HttpServerError::new(format!("Failed to read data var: {e}")),
+                )
+                .try_into_contents();
+            }
+            Ok(Some(Ok(None))) => {
                 return StacksHttpResponse::new_error(
                     &preamble,
                     &HttpNotFound::new("Data var not found".to_string()),
