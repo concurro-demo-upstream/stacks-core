@@ -96,6 +96,8 @@ impl fmt::Debug for ConversationHttp {
 }
 
 impl ConversationHttp {
+    /// Create a conversation with a freshly built RPC route table.
+    /// This compiles every RPC path regex; see `new_with_http()` to reuse a prebuilt table.
     pub fn new(
         peer_addr: SocketAddr,
         outbound_url: Option<UrlString>,
@@ -105,6 +107,29 @@ impl ConversationHttp {
         socket_send_buffer_size: u32,
     ) -> ConversationHttp {
         let stacks_http = StacksHttp::new(peer_addr, conn_opts);
+        Self::new_with_http(
+            stacks_http,
+            peer_addr,
+            outbound_url,
+            peer_host,
+            conn_opts,
+            conn_id,
+            socket_send_buffer_size,
+        )
+    }
+
+    /// Create a conversation around an existing `stacks_http` state machine, which this
+    /// conversation takes ownership of (e.g. one from `StacksHttp::clone_for_peer()`).
+    /// Otherwise identical to `new()`.
+    pub fn new_with_http(
+        stacks_http: StacksHttp,
+        peer_addr: SocketAddr,
+        outbound_url: Option<UrlString>,
+        peer_host: PeerHost,
+        conn_opts: &ConnectionOptions,
+        conn_id: usize,
+        socket_send_buffer_size: u32,
+    ) -> ConversationHttp {
         ConversationHttp {
             connection: ConnectionHttp::new(stacks_http, conn_opts, None),
             conn_id,
@@ -129,6 +154,12 @@ impl ConversationHttp {
     #[cfg(test)]
     pub fn num_pending_outbound(&self) -> usize {
         self.reply_streams.len()
+    }
+
+    /// The HTTP protocol state machine backing this conversation
+    #[cfg(test)]
+    pub fn stacks_http(&self) -> &StacksHttp {
+        &self.connection.protocol
     }
 
     /// What's our outbound URL?

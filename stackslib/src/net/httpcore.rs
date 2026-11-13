@@ -1024,6 +1024,16 @@ pub struct StacksHttp {
     pub read_only_call_max_mem_bytes: u64,
 }
 
+impl fmt::Debug for StacksHttp {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("StacksHttp")
+            .field("peer_addr", &self.peer_addr)
+            .field("num_request_handlers", &self.request_handlers.len())
+            .field("allow_arbitrary_response", &self.allow_arbitrary_response)
+            .finish()
+    }
+}
+
 impl StacksHttp {
     /// Create an HTTP protocol state machine that handles the built-in RPC API.
     /// Used for building the RPC server
@@ -1047,6 +1057,70 @@ impl StacksHttp {
         };
         http.register_rpc_methods();
         http
+    }
+
+    /// Create a per-connection HTTP protocol state machine for `peer_addr` from this one, treated
+    /// as a template of the server's RPC route table (e.g. one built by `StacksHttp::new()`).
+    ///
+    /// No regexes are compiled: each route's strict and permissive `Regex` are reference-counted
+    /// clones, and `register_rpc_endpoint()`, `path_regex()` and `make_permissive_regex()` are not
+    /// called. Each returned instance owns its own cloned handlers, which are `restart()`ed so no
+    /// parsed request state carries over from `self`; per-connection parse state starts fresh.
+    /// The result routes identically to `self` (same handler order, verbs and patterns) and
+    /// copies its configuration.
+    pub fn clone_for_peer(&self, peer_addr: SocketAddr) -> StacksHttp {
+        let request_handlers = self
+            .request_handlers
+            .iter()
+            .map(|(verb, regex, permissive_regex, handler)| {
+                let mut handler = handler.clone();
+                handler.restart();
+                (
+                    verb.clone(),
+                    regex.clone(),
+                    permissive_regex.clone(),
+                    handler,
+                )
+            })
+            .collect();
+        StacksHttp {
+            peer_addr,
+            body_start: None,
+            num_preamble_bytes: 0,
+            last_four_preamble_bytes: [0u8; 4],
+            reply: None,
+            request_handler_index: None,
+            request_handlers,
+            maximum_call_argument_size: self.maximum_call_argument_size,
+            read_only_call_limit: self.read_only_call_limit.clone(),
+            auth_token: self.auth_token.clone(),
+            allow_arbitrary_response: self.allow_arbitrary_response,
+            read_only_max_execution_time: self.read_only_max_execution_time,
+            read_only_call_max_mem_bytes: self.read_only_call_max_mem_bytes,
+        }
+    }
+
+    /// The `(verb, strict regex, permissive regex)` of each route, in matching order
+    #[cfg(test)]
+    pub fn route_signatures(&self) -> Vec<(&str, &str, &str)> {
+        self.request_handlers
+            .iter()
+            .map(|(verb, regex, permissive_regex, _)| {
+                (verb.as_str(), regex.as_str(), permissive_regex.as_str())
+            })
+            .collect()
+    }
+
+    /// The address of the peer this state machine talks to
+    #[cfg(test)]
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// The index of the handler expected to parse the reply, if any
+    #[cfg(test)]
+    pub fn request_handler_index(&self) -> Option<usize> {
+        self.request_handler_index
     }
 
     /// Create an HTTP protocol state machine that can handle arbitrary responses.

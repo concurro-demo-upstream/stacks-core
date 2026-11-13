@@ -51,8 +51,14 @@ pub struct HttpPeer {
     /// server socket address
     pub http_server_addr: SocketAddr,
 
-    /// connection options
+    /// connection options.
+    /// `rpc_template` is derived from these when the `HttpPeer` is built, so they must not be
+    /// mutated afterwards.
     pub connection_opts: ConnectionOptions,
+
+    /// RPC route table, built once from `connection_opts`, that each inbound and outbound
+    /// conversation clones (see `new_conversation()`) instead of recompiling all RPC path regexes.
+    rpc_template: StacksHttp,
 }
 
 impl HttpPeer {
@@ -61,6 +67,7 @@ impl HttpPeer {
         server_handle: usize,
         server_addr: SocketAddr,
     ) -> HttpPeer {
+        let rpc_template = StacksHttp::new(server_addr, &conn_opts);
         HttpPeer {
             peers: HashMap::new(),
             sockets: HashMap::new(),
@@ -70,7 +77,29 @@ impl HttpPeer {
             http_server_addr: server_addr,
 
             connection_opts: conn_opts,
+            rpc_template,
         }
+    }
+
+    /// Instantiate a conversation whose RPC route table is cloned from `rpc_template`, so no
+    /// regexes are compiled and each conversation owns its own handler instances.
+    fn new_conversation(
+        &self,
+        client_addr: SocketAddr,
+        outbound_url: Option<UrlString>,
+        peer_host: PeerHost,
+        event_id: usize,
+        send_buffer_size: u32,
+    ) -> ConversationHttp {
+        ConversationHttp::new_with_http(
+            self.rpc_template.clone_for_peer(client_addr),
+            client_addr,
+            outbound_url,
+            peer_host,
+            &self.connection_opts,
+            event_id,
+            send_buffer_size,
+        )
     }
 
     pub fn set_server_handle(&mut self, h: usize, addr: SocketAddr) {
@@ -240,11 +269,10 @@ impl HttpPeer {
             None => PeerHost::from_socketaddr(&client_addr),
         };
 
-        let mut new_convo = ConversationHttp::new(
+        let mut new_convo = self.new_conversation(
             client_addr,
             outbound_url.clone(),
             peer_host,
-            &self.connection_opts,
             event_id,
             send_buffer_size,
         );
@@ -770,6 +798,47 @@ mod test {
         let num_events = num_events_rx.recv().unwrap();
         http_thread.join().unwrap();
         num_events
+    }
+
+    /// Every conversation `HttpPeer::new_conversation()` makes (which `register_http()` uses for
+    /// each inbound and outbound socket) must be cloned from the peer's route table template,
+    /// not rebuilt.  The template is given an extra probe route that fresh registration never
+    /// adds: a conversation built by `ConversationHttp::new()` would lack it, and any rebuild
+    /// would call the probe's `path_regex()`.
+    #[test]
+    fn test_http_new_conversation_clones_rpc_template() {
+        use std::sync::atomic::Ordering;
+
+        use crate::net::tests::httpcore::RouteProbeHandler;
+
+        let server_addr: SocketAddr = "127.0.0.1:20443".parse().unwrap();
+        let mut peer = HttpPeer::new(ConnectionOptions::default(), 0, server_addr);
+        let probe = RouteProbeHandler::new();
+        let counter = probe.path_regex_calls.clone();
+        peer.rpc_template.register_rpc_endpoint(probe);
+
+        let baseline = counter.load(Ordering::SeqCst);
+        assert!(baseline > 0);
+        let expected_routes = peer.rpc_template.route_signatures();
+        assert_eq!(
+            expected_routes.last().unwrap().1,
+            r"^/test/route-probe/(?P<value>[a-z0-9]+)$"
+        );
+
+        for i in 0..100u16 {
+            let client_addr = SocketAddr::new("127.0.0.2".parse().unwrap(), 1000 + i);
+            let convo = peer.new_conversation(
+                client_addr,
+                None,
+                PeerHost::from_socketaddr(&client_addr),
+                usize::from(i),
+                4096,
+            );
+            assert_eq!(convo.stacks_http().route_signatures(), expected_routes);
+            assert_eq!(convo.get_peer_addr(), &client_addr);
+            assert_eq!(convo.stacks_http().peer_addr(), client_addr);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), baseline);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+New HTTP connections now clone an RPC route table built once per HTTP server, instead of recompiling all RPC path regexes on the p2p thread for every connection.

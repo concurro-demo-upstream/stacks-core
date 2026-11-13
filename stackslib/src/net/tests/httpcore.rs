@@ -15,11 +15,14 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{str, thread};
 
+use regex::{Captures, Regex};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, StacksPrivateKey};
 use stacks_common::types::net::{PeerAddress, PeerHost};
@@ -36,15 +39,19 @@ use crate::chainstate::stacks::{
 use crate::net::api::getneighbors::{RPCNeighbor, RPCNeighborsInfo};
 use crate::net::connection::ConnectionOptions;
 use crate::net::http::{
-    http_error_from_code_and_text, http_reason, HttpContentType, HttpRequestContents,
-    HttpRequestPreamble, HttpResponsePayload, HttpResponsePreamble, HttpVersion,
+    http_error_from_code_and_text, http_reason, Error as HttpError, HttpContentType, HttpRequest,
+    HttpRequestContents, HttpRequestPreamble, HttpResponse, HttpResponseContents,
+    HttpResponsePayload, HttpResponsePreamble, HttpVersion,
 };
 use crate::net::httpcore::{
-    send_http_request, HttpPreambleExtensions as _, HttpRequestContentsExtensions as _, StacksHttp,
-    StacksHttpMessage, StacksHttpPreamble, StacksHttpRequest, StacksHttpResponse,
+    send_http_request, HttpPreambleExtensions as _, HttpRequestContentsExtensions as _,
+    RPCRequestHandler, StacksHttp, StacksHttpMessage, StacksHttpPreamble, StacksHttpRequest,
+    StacksHttpResponse,
 };
 use crate::net::rpc::ConversationHttp;
-use crate::net::{CompletedPayload, ProtocolFamily, StreamRead, TipRequest};
+use crate::net::{
+    CompletedPayload, Error as NetError, ProtocolFamily, StacksNodeState, StreamRead, TipRequest,
+};
 
 #[test]
 fn test_parse_stacks_http_preamble_request_err() {
@@ -1438,4 +1445,271 @@ fn test_streamed_response_byte_accounting() {
         );
         assert_eq!(http.num_pending(), 0);
     }
+}
+
+/// Test-only stateful RPC handler used to check that route tables cloned from a template don't
+/// share per-conversation handler state, and that cloning never recompiles path regexes.
+///
+/// It serves `GET /test/route-probe/<value>`. The captured `<value>` is held in `pending` between
+/// parsing a request and replying, like real handlers that store parsed request state, and
+/// `restart()` clears it. `path_regex()` bumps the counter shared by all clones of the handler,
+/// so a rebuild of the route table shows up as an increased count.
+#[derive(Clone)]
+pub struct RouteProbeHandler {
+    /// Value captured by the last parsed request, if any
+    pending: Option<String>,
+    /// Number of times `path_regex()` was called on this handler or any of its clones
+    pub path_regex_calls: Arc<AtomicUsize>,
+}
+
+impl RouteProbeHandler {
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            path_regex_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl HttpRequest for RouteProbeHandler {
+    fn verb(&self) -> &'static str {
+        "GET"
+    }
+
+    fn path_regex(&self) -> Regex {
+        self.path_regex_calls.fetch_add(1, Ordering::SeqCst);
+        Regex::new(r"^/test/route-probe/(?P<value>[a-z0-9]+)$").unwrap()
+    }
+
+    fn metrics_identifier(&self) -> &str {
+        "/test/route-probe/:value"
+    }
+
+    fn try_parse_request(
+        &mut self,
+        _preamble: &HttpRequestPreamble,
+        captures: &Captures,
+        _query: Option<&str>,
+        _body: &[u8],
+    ) -> Result<HttpRequestContents, HttpError> {
+        self.pending = Some(captures["value"].to_string());
+        Ok(HttpRequestContents::new())
+    }
+}
+
+impl HttpResponse for RouteProbeHandler {
+    /// Report the pending value as the response text
+    fn try_parse_response(
+        &self,
+        _preamble: &HttpResponsePreamble,
+        _body: &[u8],
+    ) -> Result<HttpResponsePayload, HttpError> {
+        Ok(HttpResponsePayload::Text(
+            self.pending.clone().unwrap_or_default(),
+        ))
+    }
+}
+
+impl RPCRequestHandler for RouteProbeHandler {
+    fn restart(&mut self) {
+        self.pending = None;
+    }
+
+    fn try_handle_request(
+        &mut self,
+        _preamble: HttpRequestPreamble,
+        _contents: HttpRequestContents,
+        _node: &mut StacksNodeState,
+    ) -> Result<(HttpResponsePreamble, HttpResponseContents), NetError> {
+        Err(NetError::InvalidMessage)
+    }
+}
+
+/// Build a server-side `StacksHttp` with the built-in RPC routes plus a trailing probe route
+fn make_probe_template(
+    peer_addr: SocketAddr,
+    conn_opts: &ConnectionOptions,
+) -> (StacksHttp, Arc<AtomicUsize>) {
+    let mut http = StacksHttp::new(peer_addr, conn_opts);
+    let probe = RouteProbeHandler::new();
+    let counter = probe.path_regex_calls.clone();
+    http.register_rpc_endpoint(probe);
+    (http, counter)
+}
+
+/// Parse `GET /test/route-probe/<value>` on `http`, which stores `value` in its probe handler
+fn parse_probe_request(http: &mut StacksHttp, value: &str) {
+    let preamble = HttpRequestPreamble::new(
+        HttpVersion::Http11,
+        "GET".to_string(),
+        format!("/test/route-probe/{value}"),
+        "localhost".to_string(),
+        12345,
+        true,
+    );
+    http.try_parse_request(&preamble, &[]).unwrap();
+}
+
+/// Read the value `http`'s probe handler (the last route) is holding, via its response parser
+pub fn probe_state(http: &mut StacksHttp) -> String {
+    let probe_index = http.route_signatures().len() - 1;
+    let preamble = HttpResponsePreamble::new(
+        HttpVersion::Http11,
+        200,
+        "OK".to_string(),
+        None,
+        HttpContentType::Text,
+        true,
+    );
+    let response = http
+        .try_parse_response(probe_index, &preamble, &[])
+        .unwrap();
+    match response.destruct().1 {
+        HttpResponsePayload::Text(text) => text,
+        other => panic!("unexpected probe payload: {other:?}"),
+    }
+}
+
+/// A clone of a route table template must route exactly like a freshly built `StacksHttp`: same
+/// handlers in the same order with the same patterns, and the same `ConnectionOptions`-derived
+/// configuration.
+#[test]
+fn test_stacks_http_clone_for_peer_matches_fresh() {
+    let mut conn_opts = ConnectionOptions::default();
+    conn_opts.auth_token = Some("secret".to_string());
+    conn_opts.maximum_call_argument_size = 1234;
+    conn_opts.read_only_call_max_mem_bytes = 5678;
+    conn_opts.read_only_max_execution_time_secs = 9;
+
+    let template_addr: SocketAddr = "127.0.0.1:20443".parse().unwrap();
+    let peer_addr: SocketAddr = "127.0.0.2:30443".parse().unwrap();
+    let template = StacksHttp::new(template_addr, &conn_opts);
+    let cloned = template.clone_for_peer(peer_addr);
+    let fresh = StacksHttp::new(peer_addr, &conn_opts);
+
+    assert!(!fresh.route_signatures().is_empty());
+    assert_eq!(cloned.route_signatures(), fresh.route_signatures());
+    assert_eq!(cloned.request_handler_index(), None);
+    assert_eq!(format!("{cloned:?}"), format!("{fresh:?}"));
+    assert_eq!(
+        cloned.maximum_call_argument_size,
+        fresh.maximum_call_argument_size
+    );
+    assert_eq!(cloned.read_only_call_limit, fresh.read_only_call_limit);
+    assert_eq!(cloned.auth_token, fresh.auth_token);
+    assert_eq!(
+        cloned.read_only_max_execution_time,
+        fresh.read_only_max_execution_time
+    );
+    assert_eq!(
+        cloned.read_only_call_max_mem_bytes,
+        fresh.read_only_call_max_mem_bytes
+    );
+    assert_eq!(cloned.auth_token, Some("secret".to_string()));
+    assert_eq!(cloned.maximum_call_argument_size, 1234);
+    assert_eq!(cloned.read_only_call_max_mem_bytes, 5678);
+    assert_eq!(cloned.read_only_max_execution_time, Duration::from_secs(9));
+}
+
+/// Clones of a template must each own their handlers: they start with no parse state, even if the
+/// template has already parsed a request, and parsing on one clone never affects another clone or
+/// the template. Real routes must still parse on every clone.
+#[test]
+fn test_stacks_http_clone_for_peer_isolates_handler_state() {
+    let conn_opts = ConnectionOptions::default();
+    let addr: SocketAddr = "127.0.0.1:20443".parse().unwrap();
+    let (mut template, _) = make_probe_template(addr, &conn_opts);
+
+    // dirty the template, so a clone that failed to `restart()` its handlers would inherit it
+    parse_probe_request(&mut template, "source");
+    template.set_response_handler("GET", "/test/route-probe/source");
+    assert_eq!(probe_state(&mut template), "source");
+    assert!(template.request_handler_index().is_some());
+
+    let mut a = template.clone_for_peer("127.0.0.2:1".parse().unwrap());
+    let mut b = template.clone_for_peer("127.0.0.3:1".parse().unwrap());
+    for clone in [&a, &b] {
+        assert_eq!(clone.request_handler_index(), None);
+    }
+    assert_eq!(probe_state(&mut a), "");
+    assert_eq!(probe_state(&mut b), "");
+    assert_eq!(probe_state(&mut template), "source");
+
+    // interleaved parses on the two clones stay separate
+    parse_probe_request(&mut a, "alpha");
+    parse_probe_request(&mut b, "beta");
+    assert_eq!(probe_state(&mut a), "alpha");
+    assert_eq!(probe_state(&mut b), "beta");
+    assert_eq!(probe_state(&mut template), "source");
+
+    parse_probe_request(&mut a, "gamma");
+    assert_eq!(probe_state(&mut a), "gamma");
+    assert_eq!(probe_state(&mut b), "beta");
+    assert_eq!(probe_state(&mut template), "source");
+
+    // routes from the built-in table still parse on each clone
+    for clone in [&mut a, &mut b] {
+        let preamble = HttpRequestPreamble::new(
+            HttpVersion::Http11,
+            "GET".to_string(),
+            "/v2/info".to_string(),
+            "localhost".to_string(),
+            12345,
+            true,
+        );
+        clone.try_parse_request(&preamble, &[]).unwrap();
+    }
+}
+
+/// Cloning a template must not compile any path regex: the probe's `path_regex()` counter stays at
+/// its post-registration value however many clones are made, and every clone has the template's
+/// route signatures.
+#[test]
+fn test_stacks_http_clone_for_peer_does_not_rebuild_routes() {
+    let conn_opts = ConnectionOptions::default();
+    let addr: SocketAddr = "127.0.0.1:20443".parse().unwrap();
+    let (template, counter) = make_probe_template(addr, &conn_opts);
+    let baseline = counter.load(Ordering::SeqCst);
+    assert!(baseline > 0);
+
+    for i in 0..100u16 {
+        let clone = template.clone_for_peer(SocketAddr::new(addr.ip(), 1000 + i));
+        assert_eq!(clone.route_signatures(), template.route_signatures());
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), baseline);
+}
+
+/// Reproducible benchmark for the per-connection cost of building the RPC route table: building
+/// one from scratch (as `StacksHttp::new()` does) against cloning a template.  It reports timings
+/// only and makes no assertions about them, since wall-clock thresholds would be flaky.
+///
+/// Run with:
+/// `BLOCKSTACK_DEBUG=1 cargo test -p stackslib --release net::tests::httpcore::bench_stacks_http_clone_for_peer -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_stacks_http_clone_for_peer() {
+    const N: u32 = 100;
+    let conn_opts = ConnectionOptions::default();
+    let addr: SocketAddr = "127.0.0.1:20443".parse().unwrap();
+
+    let start = Instant::now();
+    for _ in 0..N {
+        std::hint::black_box(StacksHttp::new(addr, &conn_opts));
+    }
+    let fresh = start.elapsed();
+
+    let template = StacksHttp::new(addr, &conn_opts);
+    let start = Instant::now();
+    for _ in 0..N {
+        std::hint::black_box(template.clone_for_peer(addr));
+    }
+    let cloned = start.elapsed();
+
+    info!(
+        "StacksHttp route table construction, {N} iterations: fresh = {:?} ({:?} each), clone = {:?} ({:?} each)",
+        fresh,
+        fresh / N,
+        cloned,
+        cloned / N
+    );
 }
