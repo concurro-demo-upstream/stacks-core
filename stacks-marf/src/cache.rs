@@ -20,13 +20,21 @@ use std::collections::HashMap;
 use crate::MarfTrieId;
 
 /// Cache MARF block hash/block ID lookups.
+///
+/// SQLite is the source of truth for these mappings.  While a storage transaction is open, the
+/// cache journals the IDs it learns, so that if the transaction is abandoned, the entries whose
+/// rows were rolled back can be evicted: SQLite reuses rolled-back row IDs for later blocks.
 pub struct BlockHashCache<T: MarfTrieId> {
-    /// Mapping between trie blob IDs (i.e. rowids) and the MarfTrieId of the trie.  Contents are
-    /// never evicted, since the size of this map grows only at the rate of new Stacks blocks.
+    /// Mapping between trie blob IDs (i.e. rowids) and the MarfTrieId of the trie.  Entries are
+    /// only evicted when a transaction that inserted them is abandoned, since the size of this map
+    /// grows only at the rate of new Stacks blocks.
     block_hash_cache: HashMap<u32, T>,
 
     /// Mapping between trie blob hashes and their IDs
     block_id_cache: HashMap<T, u32>,
+
+    /// IDs inserted since `begin_transaction()`, or `None` if no transaction is open.
+    uncommitted: Option<Vec<u32>>,
 }
 
 impl<T: MarfTrieId> BlockHashCache<T> {
@@ -34,6 +42,26 @@ impl<T: MarfTrieId> BlockHashCache<T> {
         BlockHashCache {
             block_hash_cache: HashMap::new(),
             block_id_cache: HashMap::new(),
+            uncommitted: None,
+        }
+    }
+
+    /// Start journaling the entries inserted from now on.
+    pub fn begin_transaction(&mut self) {
+        self.uncommitted = Some(Vec::new());
+    }
+
+    /// Keep every entry inserted since `begin_transaction()`.
+    pub fn commit_transaction(&mut self) {
+        self.uncommitted = None;
+    }
+
+    /// Evict every entry inserted since `begin_transaction()`.
+    pub fn discard_uncommitted(&mut self) {
+        for id in self.uncommitted.take().unwrap_or_default() {
+            if let Some(block_hash) = self.block_hash_cache.remove(&id) {
+                self.block_id_cache.remove(&block_hash);
+            }
         }
     }
 
@@ -51,6 +79,9 @@ impl<T: MarfTrieId> BlockHashCache<T> {
                 let block_hash = lookup(id)?;
                 let block_hash_ref = vacant_entry.insert(block_hash.clone());
                 self.block_id_cache.insert(block_hash, id);
+                if let Some(uncommitted) = self.uncommitted.as_mut() {
+                    uncommitted.push(id);
+                }
                 Ok(block_hash_ref)
             }
         }
@@ -61,6 +92,9 @@ impl<T: MarfTrieId> BlockHashCache<T> {
         assert!(!self.block_hash_cache.contains_key(&block_id));
         self.block_id_cache.insert(block_hash.clone(), block_id);
         self.block_hash_cache.insert(block_id, block_hash);
+        if let Some(uncommitted) = self.uncommitted.as_mut() {
+            uncommitted.push(block_id);
+        }
     }
 
     /// Get an immutable reference to a block hash, given the ID

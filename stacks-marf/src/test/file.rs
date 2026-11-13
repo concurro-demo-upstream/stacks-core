@@ -313,3 +313,33 @@ fn test_bulk_read_blob_headers_sorted_empty_returns_empty() {
         assert!(headers.is_empty());
     });
 }
+
+/// Offsets cached while a transaction is open are evicted if it is abandoned, and kept if it is
+/// committed.  Offsets cached earlier are never evicted.
+#[test]
+fn test_trie_offset_cache_journal() {
+    let test_name = "test_trie_offset_cache_journal";
+    let db = setup_db(test_name);
+    let mut blobs = TrieFile::from_db_path(":memory:", false).unwrap();
+
+    // None of these rows exist in SQL, so a successful lookup can only come from the cache.
+    let cached = |blobs: &mut TrieFile, id: u32| blobs.get_trie_offset(&db, id).ok();
+
+    blobs.cache_trie_offset(1, 100);
+
+    blobs.begin_transaction();
+    blobs.cache_trie_offset(2, 200);
+    blobs.cache_trie_offset(3, 300);
+    assert_eq!(cached(&mut blobs, 2), Some(200));
+    blobs.discard_uncommitted_offsets();
+    assert_eq!(cached(&mut blobs, 1), Some(100));
+    assert_eq!(cached(&mut blobs, 2), None);
+    assert_eq!(cached(&mut blobs, 3), None);
+
+    // an offset that is cached again for a reused row ID is the new one
+    blobs.begin_transaction();
+    blobs.cache_trie_offset(2, 250);
+    blobs.commit_transaction();
+    blobs.discard_uncommitted_offsets();
+    assert_eq!(cached(&mut blobs, 2), Some(250));
+}

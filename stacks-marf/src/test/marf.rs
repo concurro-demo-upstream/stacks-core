@@ -30,7 +30,7 @@ use crate::storage::{TrieFileStorage, TrieHashCalculationMode, TrieStorageConnec
 use crate::test::{
     make_node4_path, make_node_path, merkle_test_marf, merkle_test_marf_key_value, opts,
 };
-use crate::{trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieLeaf};
+use crate::{trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, TrieLeaf};
 
 #[test]
 fn marf_insert_different_leaf_same_block_100() {
@@ -2601,5 +2601,496 @@ fn test_for_each_leaf_callback_error_propagates() {
         call_count.get(),
         1,
         "callback should have been called exactly once"
+    );
+}
+
+// -----------------------------------------------------------------------------------------------
+// Abandoned write transactions.
+//
+// A MARF handle must be usable again right after a write transaction is dropped, rolled back or
+// aborted partway through, with no cleanup call from the caller.  Each test checks the handle's
+// reads and writes, and compares root hashes against a reference handle that never saw the
+// abandoned work.
+// -----------------------------------------------------------------------------------------------
+
+const ABANDON_A: BlockHeaderHash = BlockHeaderHash([0xaa; 32]);
+const ABANDON_B: BlockHeaderHash = BlockHeaderHash([0xbb; 32]);
+const ABANDON_C: BlockHeaderHash = BlockHeaderHash([0xcc; 32]);
+
+/// Open a MARF at `path` with block A committed off the sentinel, holding `k = "va"`.
+fn abandon_marf_at(path: &str, opts: &MARFOpenOpts) -> MARF<BlockHeaderHash> {
+    let mut marf = MARF::from_path(path, opts.clone()).unwrap();
+    marf.begin(&BlockHeaderHash::sentinel(), &ABANDON_A)
+        .unwrap();
+    marf.insert("k", MARFValue::from_value("va")).unwrap();
+    marf.commit().unwrap();
+    marf
+}
+
+/// In-memory handle with block A committed.
+fn abandon_marf(opts: &MARFOpenOpts) -> MARF<BlockHeaderHash> {
+    abandon_marf_at(":memory:", opts)
+}
+
+/// Reference handle: A committed, then `block` extending A with `kvs` inserted in order and
+/// committed.  A handle that abandoned work must end with the same root hash.
+fn abandon_reference(
+    opts: &MARFOpenOpts,
+    block: &BlockHeaderHash,
+    kvs: &[(&str, &str)],
+) -> MARF<BlockHeaderHash> {
+    let mut reference = abandon_marf(opts);
+    reference.begin(&ABANDON_A, block).unwrap();
+    for (key, value) in kvs {
+        reference.insert(key, MARFValue::from_value(value)).unwrap();
+    }
+    reference.commit().unwrap();
+    reference
+}
+
+/// Read `key` at `block`, panicking on storage errors.
+fn abandon_get(
+    marf: &mut MARF<BlockHeaderHash>,
+    block: &BlockHeaderHash,
+    key: &str,
+) -> Option<String> {
+    marf.get(block, key).unwrap().map(|value| {
+        // map back to the test's string values
+        ["va", "vb", "vc", "vx", "vy", "vz", "v4"]
+            .iter()
+            .find(|candidate| MARFValue::from_value(candidate) == value)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    })
+}
+
+/// Assert that `marf` and `reference` agree on the root hash at `block`.
+fn abandon_assert_same_root(
+    marf: &mut MARF<BlockHeaderHash>,
+    reference: &mut MARF<BlockHeaderHash>,
+    block: &BlockHeaderHash,
+) {
+    assert_eq!(
+        marf.get_root_hash_at(block).unwrap(),
+        reference.get_root_hash_at(block).unwrap(),
+        "root hash at {block} diverged from a handle that never saw the abandoned work"
+    );
+}
+
+/// After an abandon, commit C off A (reusing any row ID the abandoned work held) and check
+/// that A and C read back and that C has the same root as a handle that only ever wrote C.
+fn abandon_commit_c_and_check(opts: &MARFOpenOpts, marf: &mut MARF<BlockHeaderHash>) {
+    marf.begin(&ABANDON_A, &ABANDON_C).unwrap();
+    marf.insert("k", MARFValue::from_value("vc")).unwrap();
+    marf.commit().unwrap();
+
+    assert_eq!(abandon_get(marf, &ABANDON_C, "k").as_deref(), Some("vc"));
+    assert_eq!(abandon_get(marf, &ABANDON_A, "k").as_deref(), Some("va"));
+
+    let c_id = trie_sql::get_block_identifier(marf.sqlite_conn(), &ABANDON_C).unwrap();
+    assert_eq!(
+        marf.borrow_storage_backend()
+            .get_block_hash_caching(c_id)
+            .unwrap(),
+        &ABANDON_C,
+        "block ID {c_id} must resolve to the block that now owns it"
+    );
+
+    let mut reference = abandon_reference(opts, &ABANDON_C, &[("k", "vc")]);
+    abandon_assert_same_root(marf, &mut reference, &ABANDON_C);
+    abandon_assert_same_root(marf, &mut reference, &ABANDON_A);
+}
+
+/// Dropping a transaction that extended to B and wrote to it, without flushing, leaves no open
+/// tip, no extension and no B values behind.
+#[apply(opts::tpl_all_opts)]
+fn test_abandon_unflushed_drop(marf_opts: &MARFOpenOpts) {
+    let mut marf = abandon_marf(marf_opts);
+    {
+        let mut tx = marf.begin_tx().unwrap();
+        tx.begin(&ABANDON_A, &ABANDON_B).unwrap();
+        tx.insert_batch(&["k".into()], vec![MARFValue::from_value("vb")])
+            .unwrap();
+    }
+
+    assert_eq!(marf.get_open_chain_tip(), None);
+    assert_eq!(abandon_get(&mut marf, &ABANDON_B, "k"), None);
+    assert_matches!(
+        MARF::get_path(
+            &mut marf.borrow_storage_backend(),
+            &ABANDON_B,
+            &TrieHash::from_key("k")
+        ),
+        Err(Error::NotFoundError)
+    );
+    abandon_commit_c_and_check(marf_opts, &mut marf);
+}
+
+/// Abandoning a transaction after B was flushed (so it took SQLite row 2 and cached its ID)
+/// must not leak B's block ID: C reuses the row and has to resolve to itself.  Covers both
+/// dropping the `MarfTransaction` and rolling back a raw storage transaction.
+#[apply(opts::tpl_all_opts)]
+fn test_abandon_flushed_reuses_row_id(marf_opts: &MARFOpenOpts) {
+    // dropped MarfTransaction
+    let mut marf = abandon_marf(marf_opts);
+    {
+        let mut tx = marf.begin_tx().unwrap();
+        tx.begin(&ABANDON_A, &ABANDON_B).unwrap();
+        tx.insert_batch(&["k".into()], vec![MARFValue::from_value("vb")])
+            .unwrap();
+        tx.storage.flush().unwrap();
+        tx.storage.open_block(&ABANDON_B).unwrap();
+        assert_eq!(
+            MARF::get_by_key(&mut tx.storage, &ABANDON_B, "k").unwrap(),
+            Some(MARFValue::from_value("vb"))
+        );
+    }
+    assert_eq!(marf.get_open_chain_tip(), None);
+    assert_eq!(abandon_get(&mut marf, &ABANDON_B, "k"), None);
+    abandon_commit_c_and_check(marf_opts, &mut marf);
+
+    // rolled-back storage transaction
+    let mut marf = abandon_marf(marf_opts);
+    {
+        let mut stx = marf.borrow_storage_transaction();
+        stx.open_block(&ABANDON_A).unwrap();
+        MARF::extend_trie(&mut stx, &ABANDON_B).unwrap();
+        MARF::insert_leaf(
+            &mut stx,
+            &ABANDON_B,
+            &TrieHash::from_key("k"),
+            &TrieLeaf::from_value(&[], MARFValue::from_value("vb")),
+        )
+        .unwrap();
+        stx.flush().unwrap();
+        stx.open_block(&ABANDON_B).unwrap();
+        stx.rollback();
+    }
+    assert_eq!(abandon_get(&mut marf, &ABANDON_B, "k"), None);
+    abandon_commit_c_and_check(marf_opts, &mut marf);
+}
+
+/// `MarfTransaction::drop_current()` after a flush leaves the handle usable as well.
+#[apply(opts::tpl_all_opts)]
+fn test_abandon_drop_current_after_flush(marf_opts: &MARFOpenOpts) {
+    let mut marf = abandon_marf(marf_opts);
+    let mut tx = marf.begin_tx().unwrap();
+    tx.begin(&ABANDON_A, &ABANDON_B).unwrap();
+    tx.insert_batch(&["k".into()], vec![MARFValue::from_value("vb")])
+        .unwrap();
+    tx.storage.flush().unwrap();
+    tx.storage.open_block(&ABANDON_B).unwrap();
+    tx.drop_current();
+
+    assert_eq!(marf.get_open_chain_tip(), None);
+    assert_eq!(abandon_get(&mut marf, &ABANDON_B, "k"), None);
+    abandon_commit_c_and_check(marf_opts, &mut marf);
+}
+
+/// A per-call write that fails after it has already modified the trie is abandoned: the open
+/// tip and the extension stay exactly as they were, and later writes and the root hash are
+/// unaffected.
+#[apply(opts::tpl_all_opts)]
+fn test_abandon_failed_per_call_insert(marf_opts: &MARFOpenOpts) {
+    let mut marf = abandon_marf(marf_opts);
+    marf.begin(&ABANDON_A, &ABANDON_B).unwrap();
+    marf.insert("k", MARFValue::from_value("vb")).unwrap();
+
+    let check_unchanged = |marf: &mut MARF<BlockHeaderHash>| {
+        assert_eq!(marf.get_open_chain_tip(), Some(&ABANDON_B));
+        assert_eq!(abandon_get(marf, &ABANDON_B, "k").as_deref(), Some("vb"));
+        assert_eq!(abandon_get(marf, &ABANDON_B, "k3"), None);
+        assert_eq!(abandon_get(marf, &ABANDON_B, "k5"), None);
+    };
+
+    // overwrite of an existing key
+    marf.borrow_storage_backend().arm_root_hash_failure();
+    assert!(marf.insert("k", MARFValue::from_value("vx")).is_err());
+    check_unchanged(&mut marf);
+
+    // append of a new key
+    marf.borrow_storage_backend().arm_root_hash_failure();
+    assert!(marf.insert("k3", MARFValue::from_value("vy")).is_err());
+    check_unchanged(&mut marf);
+
+    // batch mixing an overwrite and an append
+    marf.borrow_storage_backend().arm_root_hash_failure();
+    assert!(marf
+        .insert_batch(
+            &["k".into(), "k5".into()],
+            vec![MARFValue::from_value("vx"), MARFValue::from_value("vz")]
+        )
+        .is_err());
+    check_unchanged(&mut marf);
+
+    marf.insert("k4", MARFValue::from_value("v4")).unwrap();
+    marf.commit().unwrap();
+    assert_eq!(
+        abandon_get(&mut marf, &ABANDON_B, "k4").as_deref(),
+        Some("v4")
+    );
+
+    let mut reference = abandon_reference(marf_opts, &ABANDON_B, &[("k", "vb"), ("k4", "v4")]);
+    abandon_assert_same_root(&mut marf, &mut reference, &ABANDON_B);
+    abandon_commit_c_and_check(marf_opts, &mut marf);
+}
+
+/// Abandoning a transaction that wrote to an extension opened by an earlier transaction undoes
+/// those writes without touching what was written before the transaction began.
+#[apply(opts::tpl_all_opts)]
+fn test_abandon_writes_to_preexisting_extension(marf_opts: &MARFOpenOpts) {
+    let check_b = |marf: &mut MARF<BlockHeaderHash>| {
+        assert_eq!(marf.get_open_chain_tip(), Some(&ABANDON_B));
+        assert_eq!(abandon_get(marf, &ABANDON_B, "k").as_deref(), Some("vb"));
+        assert_eq!(abandon_get(marf, &ABANDON_B, "k2"), None);
+    };
+    let finish = |marf: &mut MARF<BlockHeaderHash>| {
+        marf.commit().unwrap();
+        let mut reference = abandon_reference(marf_opts, &ABANDON_B, &[("k", "vb")]);
+        abandon_assert_same_root(marf, &mut reference, &ABANDON_B);
+        abandon_commit_c_and_check(marf_opts, marf);
+    };
+    let open_b = || {
+        let mut marf = abandon_marf(marf_opts);
+        marf.begin(&ABANDON_A, &ABANDON_B).unwrap();
+        marf.insert("k", MARFValue::from_value("vb")).unwrap();
+        marf
+    };
+
+    // dropped MarfTransaction overwrote a key and added another
+    let mut marf = open_b();
+    {
+        let mut tx = marf.begin_tx().unwrap();
+        tx.insert_batch(
+            &["k".into(), "k2".into()],
+            vec![MARFValue::from_value("vx"), MARFValue::from_value("vy")],
+        )
+        .unwrap();
+    }
+    check_b(&mut marf);
+    finish(&mut marf);
+
+    // rolled-back storage transaction
+    let mut marf = open_b();
+    {
+        let mut stx = marf.borrow_storage_transaction();
+        for (key, value) in [("k", "vx"), ("k2", "vy")] {
+            MARF::insert_leaf(
+                &mut stx,
+                &ABANDON_B,
+                &TrieHash::from_key(key),
+                &TrieLeaf::from_value(&[], MARFValue::from_value(value)),
+            )
+            .unwrap();
+        }
+        stx.rollback();
+    }
+    check_b(&mut marf);
+    finish(&mut marf);
+
+    // sealing inside an abandoned transaction does not freeze the extension
+    let mut marf = open_b();
+    {
+        let mut tx = marf.begin_tx().unwrap();
+        tx.seal().unwrap();
+    }
+    check_b(&mut marf);
+    marf.insert("k3", MARFValue::from_value("vy")).unwrap();
+    assert_eq!(
+        abandon_get(&mut marf, &ABANDON_B, "k3").as_deref(),
+        Some("vy")
+    );
+    marf.commit().unwrap();
+    let mut reference = abandon_reference(marf_opts, &ABANDON_B, &[("k", "vb"), ("k3", "vy")]);
+    abandon_assert_same_root(&mut marf, &mut reference, &ABANDON_B);
+    abandon_assert_same_root(&mut marf, &mut reference, &ABANDON_A);
+}
+
+/// An abandoned transaction that flushed (consumed) an extension opened earlier gives that
+/// extension back, and it can still be committed.
+#[apply(opts::tpl_all_opts)]
+fn test_abandon_consumed_preexisting_extension(marf_opts: &MARFOpenOpts) {
+    let mut marf = abandon_marf(marf_opts);
+    marf.begin(&ABANDON_A, &ABANDON_B).unwrap();
+    marf.insert("k", MARFValue::from_value("vb")).unwrap();
+    {
+        let mut tx = marf.begin_tx().unwrap();
+        tx.storage.flush().unwrap();
+    }
+    assert_eq!(marf.get_open_chain_tip(), Some(&ABANDON_B));
+    assert_eq!(
+        abandon_get(&mut marf, &ABANDON_B, "k").as_deref(),
+        Some("vb")
+    );
+
+    marf.commit().unwrap();
+    let mut reference = abandon_reference(marf_opts, &ABANDON_B, &[("k", "vb")]);
+    abandon_assert_same_root(&mut marf, &mut reference, &ABANDON_B);
+    abandon_commit_c_and_check(marf_opts, &mut marf);
+}
+
+/// Same as above for an unconfirmed extension, which is stored in a different SQL table.
+#[test]
+fn test_abandon_consumed_preexisting_unconfirmed_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marf.sqlite");
+    let path = path.to_str().unwrap();
+    drop(abandon_marf_at(path, &opts::OPTS_IMM));
+
+    // reference: the same unconfirmed trie, committed without any abandoned transaction
+    let reference_dir = tempfile::tempdir().unwrap();
+    let reference_path = reference_dir.path().join("marf.sqlite");
+    let reference_path = reference_path.to_str().unwrap();
+    drop(abandon_marf_at(reference_path, &opts::OPTS_IMM));
+    let mut reference =
+        MARF::<BlockHeaderHash>::from_path_unconfirmed(reference_path, opts::OPTS_IMM.clone())
+            .unwrap();
+    let unconfirmed = reference.begin_unconfirmed(&ABANDON_A).unwrap();
+    reference.insert("ku", MARFValue::from_value("vx")).unwrap();
+    reference.commit().unwrap();
+    let reference_root = reference.get_root_hash_at(&unconfirmed).unwrap();
+    let reference_a_root = reference.get_root_hash_at(&ABANDON_A).unwrap();
+
+    let mut marf =
+        MARF::<BlockHeaderHash>::from_path_unconfirmed(path, opts::OPTS_IMM.clone()).unwrap();
+    assert_eq!(marf.begin_unconfirmed(&ABANDON_A).unwrap(), unconfirmed);
+    marf.insert("ku", MARFValue::from_value("vx")).unwrap();
+    {
+        let mut tx = marf.begin_tx().unwrap();
+        tx.storage.flush().unwrap();
+    }
+    assert_eq!(marf.get_open_chain_tip(), Some(&unconfirmed));
+    assert_eq!(
+        abandon_get(&mut marf, &unconfirmed, "ku").as_deref(),
+        Some("vx")
+    );
+
+    // still extending: a second extension is refused, as before the transaction
+    assert_matches!(
+        marf.begin_tx().unwrap().begin_unconfirmed(&ABANDON_A),
+        Err(Error::InProgressError)
+    );
+
+    // the extension can be committed, then re-opened
+    marf.commit().unwrap();
+    assert_eq!(marf.get_root_hash_at(&unconfirmed).unwrap(), reference_root);
+    assert_eq!(marf.get_root_hash_at(&ABANDON_A).unwrap(), reference_a_root);
+    assert_eq!(marf.begin_unconfirmed(&ABANDON_A).unwrap(), unconfirmed);
+    assert_eq!(
+        abandon_get(&mut marf, &unconfirmed, "ku").as_deref(),
+        Some("vx")
+    );
+    marf.commit().unwrap();
+    assert_eq!(marf.get_root_hash_at(&unconfirmed).unwrap(), reference_root);
+
+    // dropping unconfirmed state inside the transaction removes it for good
+    marf.begin_unconfirmed(&ABANDON_A).unwrap();
+    marf.begin_tx().unwrap().drop_unconfirmed();
+    assert_eq!(marf.get_open_chain_tip(), None);
+    marf.begin_unconfirmed(&ABANDON_A).unwrap();
+    assert_eq!(abandon_get(&mut marf, &unconfirmed, "ku"), None);
+}
+
+/// An explicit `drop_current()` on an extension opened by an earlier transaction discards the
+/// extension and releases its lock, so the same block can be extended again right away.
+#[test]
+fn test_drop_current_of_preexisting_extension() {
+    let marf_opts = &*opts::OPTS_IMM;
+
+    // confirmed
+    let mut marf = abandon_marf(marf_opts);
+    marf.begin(&ABANDON_A, &ABANDON_B).unwrap();
+    marf.insert("k", MARFValue::from_value("vx")).unwrap();
+    marf.begin_tx().unwrap().drop_current();
+    assert_eq!(marf.get_open_chain_tip(), None);
+
+    marf.begin(&ABANDON_A, &ABANDON_B).unwrap();
+    marf.insert("k", MARFValue::from_value("vb")).unwrap();
+    marf.commit().unwrap();
+    let mut reference = abandon_reference(marf_opts, &ABANDON_B, &[("k", "vb")]);
+    abandon_assert_same_root(&mut marf, &mut reference, &ABANDON_B);
+
+    // unconfirmed
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marf.sqlite");
+    let path = path.to_str().unwrap();
+    drop(abandon_marf_at(path, marf_opts));
+    let mut marf = MARF::<BlockHeaderHash>::from_path_unconfirmed(path, marf_opts.clone()).unwrap();
+    let unconfirmed = marf.begin_unconfirmed(&ABANDON_A).unwrap();
+    marf.insert("ku", MARFValue::from_value("vx")).unwrap();
+    marf.begin_tx().unwrap().drop_current();
+    assert_eq!(marf.get_open_chain_tip(), None);
+
+    marf.begin_unconfirmed(&ABANDON_A).unwrap();
+    assert_eq!(abandon_get(&mut marf, &unconfirmed, "ku"), None);
+}
+
+/// Cached blob offsets of an abandoned transaction must not be used for a later block that
+/// reuses the row ID but lands at a different file offset.
+#[test]
+fn test_abandon_external_blob_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marf.sqlite");
+    let mut marf = abandon_marf_at(path.to_str().unwrap(), &opts::OPTS_IMM_EXT);
+
+    let b1 = BlockHeaderHash([0xb1; 32]);
+    let b2 = BlockHeaderHash([0xb2; 32]);
+    let c1 = BlockHeaderHash([0xc1; 32]);
+    let c2 = BlockHeaderHash([0xc2; 32]);
+
+    // Abandon two flushed blocks (rows 2 and 3), reading from each so their offsets get cached.
+    {
+        let mut stx = marf.borrow_storage_transaction();
+        for block in [&b1, &b2] {
+            stx.open_block(&ABANDON_A).unwrap();
+            MARF::extend_trie(&mut stx, block).unwrap();
+            MARF::insert_leaf(
+                &mut stx,
+                block,
+                &TrieHash::from_key("k1"),
+                &TrieLeaf::from_value(&[], MARFValue::from_value("vx")),
+            )
+            .unwrap();
+            stx.flush().unwrap();
+            stx.open_block(block).unwrap();
+            assert_eq!(
+                MARF::get_by_key(&mut stx, block, "k1").unwrap(),
+                Some(MARFValue::from_value("vx"))
+            );
+        }
+    }
+
+    // C1 and C2 reuse rows 2 and 3 but their blobs have different sizes than B1's and B2's.
+    marf.begin(&ABANDON_A, &c1).unwrap();
+    for i in 0..40 {
+        marf.insert(&format!("c1-{i}"), MARFValue::from_value("vc"))
+            .unwrap();
+    }
+    marf.commit().unwrap();
+    marf.begin(&ABANDON_A, &c2).unwrap();
+    marf.insert("c2", MARFValue::from_value("vy")).unwrap();
+    marf.commit().unwrap();
+
+    assert_eq!(
+        marf.get(&c1, "c1-39").unwrap(),
+        Some(MARFValue::from_value("vc"))
+    );
+    assert_eq!(
+        marf.get(&c2, "c2").unwrap(),
+        Some(MARFValue::from_value("vy"))
+    );
+    assert_eq!(abandon_get(&mut marf, &c2, "k").as_deref(), Some("va"));
+
+    // roots match handles that never saw the abandoned blocks
+    let c1_keys: Vec<String> = (0..40).map(|i| format!("c1-{i}")).collect();
+    let c1_kvs: Vec<(&str, &str)> = c1_keys.iter().map(|key| (key.as_str(), "vc")).collect();
+    let mut reference = abandon_reference(&opts::OPTS_IMM_EXT, &c1, &c1_kvs);
+    abandon_assert_same_root(&mut marf, &mut reference, &c1);
+    abandon_assert_same_root(&mut marf, &mut reference, &ABANDON_A);
+    let mut reference = abandon_reference(&opts::OPTS_IMM_EXT, &c2, &[("c2", "vy")]);
+    abandon_assert_same_root(&mut marf, &mut reference, &c2);
+    assert_eq!(
+        abandon_get(&mut marf, &ABANDON_A, "k").as_deref(),
+        Some("va")
     );
 }

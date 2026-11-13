@@ -104,6 +104,9 @@ pub struct MARF<T: MarfTrieId> {
 pub struct MarfTransaction<'a, T: MarfTrieId> {
     pub(crate) storage: TrieStorageTransaction<'a, T>,
     open_chain_tip: &'a mut Option<WriteChainTip<T>>,
+    /// The MARF's open chain tip as it was when the transaction began, to restore if the
+    /// transaction is abandoned.  `None` once the transaction is finished.
+    tip_at_begin: Option<Option<WriteChainTip<T>>>,
 }
 
 #[derive(Clone)]
@@ -309,18 +312,29 @@ impl<T: MarfTrieId> MarfConnection<T> for MARF<T> {
 /// MarfTransaction represents a connection to a MARF index,
 ///   with an open storage transaction. If this struct is
 ///   dropped without calling commit(), the storage transaction is
-///   aborted
+///   aborted: its SQL changes are rolled back, and the MARF's open chain tip and the storage's
+///   in-memory state (open block, extension, caches) return to what they were when the
+///   transaction began, with no cleanup call from the caller.  A commit that fails also leaves
+///   the MARF that way.
 ///
 impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
     pub fn commit(mut self) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
         }
-        if let Some(_tip) = self.open_chain_tip.take() {
+        if self.open_chain_tip.is_some() {
             self.storage.flush()?;
         }
-        self.storage.commit_tx();
+        self.storage.commit_in_place();
+        *self.open_chain_tip = None;
+        self.finish();
         Ok(())
+    }
+
+    /// Make the transaction's effects final, so that dropping it no longer restores the open
+    /// chain tip.  Call after the storage transaction has been committed or rolled back.
+    fn finish(&mut self) {
+        self.tip_at_begin = None;
     }
 
     /// Finish writing the next trie in the MARF, but change the hash of the current Trie's
@@ -332,16 +346,20 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         if self.storage.unconfirmed() {
             return Err(Error::UnconfirmedError);
         }
-        if let Some(_tip) = self.open_chain_tip.take() {
+        if self.open_chain_tip.is_some() {
             self.storage.flush_to(real_bhh)?;
-            self.storage.commit_tx();
+            self.storage.commit_in_place();
+            *self.open_chain_tip = None;
+            self.finish();
         }
         Ok(())
     }
 
     /// Discard the provisional trie and commit the remaining SQL changes in this transaction.
     ///
-    /// Clears transient trie state even on lock-release failure, so the placeholder can be reused.
+    /// On lock-release failure the transaction is abandoned when it is dropped, which restores
+    /// the state it began with; a provisional trie that began in this transaction is gone, so the
+    /// placeholder can be reused.
     pub fn discard_trie_and_commit(mut self) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -350,9 +368,10 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
             return Err(Error::UnconfirmedError);
         }
 
-        self.open_chain_tip.take();
         self.storage.discard_provisional_trie()?;
-        self.storage.commit_tx();
+        self.storage.commit_in_place();
+        *self.open_chain_tip = None;
+        self.finish();
 
         Ok(())
     }
@@ -378,8 +397,9 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    fn commit_tx(self) {
-        self.storage.commit_tx()
+    fn commit_tx(mut self) {
+        self.storage.commit_in_place();
+        self.finish();
     }
 
     pub fn sqlite_tx(&self) -> &Transaction<'a> {
@@ -398,9 +418,10 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
         }
-        self.open_chain_tip.take();
         self.storage.drop_extending_trie();
-        self.storage.commit_tx();
+        self.storage.commit_in_place();
+        *self.open_chain_tip = None;
+        self.finish();
         Ok(())
     }
 
@@ -580,6 +601,9 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     /// Insert a batch of key/value pairs.  More efficient than inserting them individually, since
     /// the trie root hash will only be calculated once (which is an O(log B) operation).
+    ///
+    /// If this fails partway, the pairs written so far stay in the trie for the caller to commit
+    /// or to abandon the transaction.
     pub fn insert_batch(&mut self, keys: &[String], values: Vec<MARFValue>) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -638,10 +662,14 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     /// Drop the current trie from the MARF. This rolls back all
     ///   changes in the block, and closes the current chain tip.
-    pub fn drop_current(self) {
+    ///
+    /// This holds even if the trie was opened by an earlier transaction: its lock is released
+    ///   here, so the same block can be extended again right away.
+    pub fn drop_current(mut self) {
         if !self.storage.readonly() {
-            self.open_chain_tip.take();
-            self.storage.rollback_trie()
+            self.storage.rollback_trie_in_place();
+            *self.open_chain_tip = None;
+            self.finish();
         }
     }
 
@@ -657,7 +685,8 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
                 // Dropping unconfirmed state cannot be done with a tx rollback,
                 //   because the unconfirmed state may already have been written
                 //   to the sqlite table before this transaction began
-                self.storage.commit_tx()
+                self.storage.commit_in_place();
+                self.finish();
             } else {
                 trace!("drop_unconfirmed() noop");
             }
@@ -673,6 +702,16 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         }
         let root_hash = self.storage.seal()?;
         Ok(root_hash)
+    }
+}
+
+impl<T: MarfTrieId> Drop for MarfTransaction<'_, T> {
+    /// Abandoning the transaction restores the MARF's open chain tip.  The storage transaction
+    /// restores its own state when it is dropped right after.
+    fn drop(&mut self) {
+        if let Some(tip_at_begin) = self.tip_at_begin.take() {
+            *self.open_chain_tip = tip_at_begin;
+        }
     }
 }
 
@@ -709,6 +748,8 @@ impl<T: MarfTrieId> MARF<T> {
     pub fn seal(&mut self) -> Result<TrieHash, Error> {
         let mut tx = self.begin_tx()?;
         let h = tx.seal()?;
+        // sealing must outlive the transaction, which is otherwise abandoned when dropped
+        tx.commit_tx();
         Ok(h)
     }
 
@@ -1453,6 +1494,7 @@ impl<T: MarfTrieId> MARF<T> {
         let storage = self.storage.transaction()?;
         Ok(MarfTransaction {
             storage,
+            tip_at_begin: Some(self.open_chain_tip.clone()),
             open_chain_tip: &mut self.open_chain_tip,
         })
     }
@@ -1547,13 +1589,14 @@ impl<T: MarfTrieId> MARF<T> {
                 let mut tx = self.storage.transaction()?;
                 let (cur_block_hash, cur_block_id) = tx.get_cur_block_and_id();
 
-                let result = MARF::insert_leaf(&mut tx, block_hash, &path, &marf_leaf);
+                // If the insert fails partway, `tx` is dropped, which abandons the write.
+                MARF::insert_leaf(&mut tx, block_hash, &path, &marf_leaf)?;
 
                 // restore
                 tx.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
                 tx.commit_tx();
 
-                result
+                Ok(())
             }
         }
     }
@@ -1596,10 +1639,11 @@ impl<T: MarfTrieId> MARF<T> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
         }
-        if let Some(_tip) = self.open_chain_tip.take() {
+        if self.open_chain_tip.is_some() {
             let mut tx = self.storage.transaction()?;
             tx.flush()?;
             tx.commit_tx();
+            self.open_chain_tip = None;
         }
         Ok(())
     }
@@ -1613,10 +1657,11 @@ impl<T: MarfTrieId> MARF<T> {
         if self.storage.unconfirmed() {
             return Err(Error::UnconfirmedError);
         }
-        if let Some(_tip) = self.open_chain_tip.take() {
+        if self.open_chain_tip.is_some() {
             let mut tx = self.storage.transaction()?;
             tx.flush_to(real_bhh)?;
             tx.commit_tx();
+            self.open_chain_tip = None;
         }
         Ok(())
     }

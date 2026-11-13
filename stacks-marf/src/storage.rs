@@ -205,6 +205,17 @@ pub enum UncommittedState<T: MarfTrieId> {
 }
 
 impl<T: MarfTrieId> UncommittedState<T> {
+    /// Copy this state as it was when the TrieRAM's undo journal was started, or as it is now if
+    /// no journal is active.
+    fn rewound_clone(&self) -> UncommittedState<T> {
+        match self {
+            UncommittedState::RW(trie_ram) => UncommittedState::RW(trie_ram.rewound_clone()),
+            UncommittedState::Sealed(trie_ram, root_hash) => {
+                UncommittedState::Sealed(trie_ram.rewound_clone(), *root_hash)
+            }
+        }
+    }
+
     /// Clear the contents
     pub fn format(&mut self) -> Result<(), Error> {
         match self {
@@ -382,7 +393,12 @@ impl<T: MarfTrieId> UncommittedState<T> {
 /// traversal/indexing paths are intentionally bounded to `u32`.
 /// Large `u64` byte offsets are only materialized when serializing this trie
 /// to persistent storage (see `dump_consume`/`dump_compressed_consume`).
-#[derive(Clone)]
+///
+/// A `TrieRAM` can keep an undo journal (see `begin_undo()`), which lets a storage transaction that
+/// is abandoned rewind an extension that an earlier transaction opened.  Only `write_nodetype()`
+/// and `write_node_hash()` change a `TrieRAM`'s nodes in place, so they are the only writers that
+/// journal; everything else that replaces or consumes the TrieRAM goes through
+/// `TrieStorageTransaction::preserve_open_extension()` first.
 pub struct TrieRAM<T: MarfTrieId> {
     data: Vec<(TrieNodeType, TrieHash)>,
     block_header: T,
@@ -397,6 +413,49 @@ pub struct TrieRAM<T: MarfTrieId> {
     is_moved: bool,
 
     parent: T,
+
+    /// Journal for rewinding the writes made since `begin_undo()`, if one is active.  It is not
+    /// copied by `clone()`.
+    undo: Option<TrieRamUndo>,
+}
+
+/// What it takes to rewind a [`TrieRAM`] to the point where its undo journal was started.
+struct TrieRamUndo {
+    /// Number of nodes at that point; nodes at or past this index were appended since.
+    len: usize,
+    /// `TrieRAM::write_count` at that point.
+    write_count: u64,
+    /// `TrieRAM::total_bytes` at that point.
+    total_bytes: usize,
+    /// The value each node below `len` had at that point, for those overwritten since.
+    overwritten: HashMap<usize, (TrieNodeType, TrieHash)>,
+}
+
+impl TrieRamUndo {
+    /// Remember `existing`, the value of slot `index` before it is overwritten, if this is the
+    /// first overwrite of a slot that predates the journal.
+    fn record_overwrite(&mut self, index: usize, existing: &(TrieNodeType, TrieHash)) {
+        if index < self.len {
+            self.overwritten
+                .entry(index)
+                .or_insert_with(|| existing.clone());
+        }
+    }
+}
+
+impl<T: MarfTrieId> Clone for TrieRAM<T> {
+    fn clone(&self) -> TrieRAM<T> {
+        TrieRAM {
+            data: self.data.clone(),
+            block_header: self.block_header.clone(),
+            readonly: self.readonly,
+            write_count: self.write_count,
+            total_bytes: self.total_bytes,
+            is_moved: self.is_moved,
+            parent: self.parent.clone(),
+            undo: None,
+        }
+    }
 }
 
 pub enum DumpPtr {
@@ -456,6 +515,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
             is_moved: false,
 
             parent: parent.clone(),
+
+            undo: None,
         }
     }
 
@@ -473,6 +534,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
             is_moved: false,
 
             parent,
+
+            undo: None,
         }
     }
 
@@ -498,7 +561,54 @@ impl<T: MarfTrieId> TrieRAM<T> {
             is_moved: true,
 
             parent: self.parent.clone(),
+
+            undo: None,
         }
+    }
+
+    /// Start journaling the writes made from now on, so that `rewind()` can undo them.
+    /// Replaces any earlier journal.
+    pub(crate) fn begin_undo(&mut self) {
+        self.undo = Some(TrieRamUndo {
+            len: self.data.len(),
+            write_count: self.write_count,
+            total_bytes: self.total_bytes,
+            overwritten: HashMap::new(),
+        });
+    }
+
+    /// Stop journaling and keep the writes made since `begin_undo()`.
+    pub(crate) fn end_undo(&mut self) {
+        self.undo = None;
+    }
+
+    /// Undo every write made since `begin_undo()` and stop journaling.  No-op if no journal is
+    /// active.
+    pub(crate) fn rewind(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            self.apply_undo(&undo);
+        }
+    }
+
+    /// Copy of this TrieRAM as it was at `begin_undo()`, or as it is now if no journal is active.
+    /// The copy has no journal.
+    pub(crate) fn rewound_clone(&self) -> TrieRAM<T> {
+        let mut rewound = self.clone();
+        if let Some(undo) = self.undo.as_ref() {
+            rewound.apply_undo(undo);
+        }
+        rewound
+    }
+
+    fn apply_undo(&mut self, undo: &TrieRamUndo) {
+        self.data.truncate(undo.len);
+        for (index, original) in undo.overwritten.iter() {
+            if let Some(slot) = self.data.get_mut(*index) {
+                *slot = original.clone();
+            }
+        }
+        self.write_count = undo.write_count;
+        self.total_bytes = undo.total_bytes;
     }
 
     /// Take a given `TrieRAM` and move its `data` to this `TrieRAM`'s data.
@@ -1187,7 +1297,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     }
 
     /// Hint as to how many entries to allocate for the inner Vec when creating a TrieRAM
-    fn size_hint(&self) -> usize {
+    pub(crate) fn size_hint(&self) -> usize {
         self.write_count as usize
         // the size hint is used for a capacity guess on the data vec, which is _nodes_
         //  NOT bytes. this led to enormous over-allocations
@@ -1281,6 +1391,9 @@ impl<T: MarfTrieId> TrieRAM<T> {
         self.write_count += 1;
         let node_index = node_array_ptr as usize;
         if let Some(existing_node) = self.data.get_mut(node_index) {
+            if let Some(undo) = self.undo.as_mut() {
+                undo.record_overwrite(node_index, existing_node);
+            }
             *existing_node = (node.clone(), hash);
             Ok(())
         } else if node_array_ptr
@@ -1312,6 +1425,9 @@ impl<T: MarfTrieId> TrieRAM<T> {
         // can only set the hash of an existing node
         let node_index = node_array_ptr as usize;
         if let Some(existing_node) = self.data.get_mut(node_index) {
+            if let Some(undo) = self.undo.as_mut() {
+                undo.record_overwrite(node_index, existing_node);
+            }
             existing_node.1 = hash;
             Ok(())
         } else {
@@ -1374,6 +1490,8 @@ impl NodeHashReader for TrieSqlCursor<'_> {
 enum SqliteConnection<'a> {
     ConnRef(&'a Connection),
     Tx(Transaction<'a>),
+    /// The transaction was committed or rolled back; no SQL may be run through this connection.
+    Finished,
 }
 
 impl Deref for SqliteConnection<'_> {
@@ -1382,6 +1500,9 @@ impl Deref for SqliteConnection<'_> {
         match self {
             SqliteConnection::ConnRef(x) => x,
             SqliteConnection::Tx(tx) => tx,
+            SqliteConnection::Finished => {
+                panic!("BUG: used a MARF storage transaction after it finished")
+            }
         }
     }
 }
@@ -1404,7 +1525,48 @@ impl<'a, T: MarfTrieId> DerefMut for TrieStorageTransaction<'a, T> {
 ///   open SQLite transaction. Any storage methods which require a transaction
 ///   are defined _only_ for this struct (e.g., the flush methods).
 ///
-pub struct TrieStorageTransaction<'a, T: MarfTrieId>(TrieStorageConnection<'a, T>);
+/// A transaction is abandoned if it is dropped, or finished with `rollback()`, without being
+///   committed with `commit_tx()`.  Abandoning it rolls back its SQL changes and restores the
+///   storage's in-memory state to what it was when the transaction began: the open block, the
+///   extension (and any writes made to it) and the block hash and blob offset caches.  The caller
+///   needs no cleanup call.  This relies on every method that takes or replaces
+///   `uncommitted_writes` either borrowing it or calling `preserve_open_extension()` first.
+///
+/// Locks that were committed before the transaction began are SQL state and come back with the
+///   rollback, so memory and SQL agree.  `rollback_trie()` is different: it discards the
+///   extension instead of restoring it.
+///
+pub struct TrieStorageTransaction<'a, T: MarfTrieId>(
+    TrieStorageConnection<'a, T>,
+    /// What to restore if the transaction is abandoned.  `None` once it is committed or rolled
+    /// back.
+    Option<TxCheckpoint<T>>,
+);
+
+/// Transient storage state captured when a [`TrieStorageTransaction`] begins.
+struct TxCheckpoint<T: MarfTrieId> {
+    /// The open block at that point.
+    cur_block: T,
+    /// The row ID of the open block at that point.
+    cur_block_id: Option<u32>,
+    /// The squash metadata at that point.
+    squash_info: Option<SquashInfo>,
+    /// The extension that was already open at that point, if any.
+    extension: Option<ExtensionCheckpoint<T>>,
+}
+
+/// An extension that was already open when a [`TrieStorageTransaction`] began.
+struct ExtensionCheckpoint<T: MarfTrieId> {
+    /// Its block hash.
+    bhh: T,
+    /// Its state at the start of the transaction, once the transaction takes or replaces it.
+    /// While it is `None`, the extension is still in place and the TrieRAM's undo journal can
+    /// rewind it.
+    saved: Option<UncommittedState<T>>,
+}
+
+/// Name of the SQL savepoint taken when a transaction begins with an extension open.
+const TX_BEGIN_SAVEPOINT: &str = "marf_tx_begin";
 
 /// Hash calculation mode
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -1488,6 +1650,11 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
 
     /// Snapshot metadata if this MARF is squashed.
     squash_info: Option<SquashInfo>,
+
+    /// Test-only one-shot fault: make the next [`Trie::recalculate_root_hash`] fail after the
+    /// leaf has already been written.
+    #[cfg(test)]
+    test_fail_next_root_hash: bool,
 }
 
 /// Snapshot metadata cached at open time for squashed MARFs.
@@ -1649,6 +1816,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             unconfirmed: self.unconfirmed(),
 
             squash_info: self.data.squash_info.clone(),
+
+            #[cfg(test)]
+            test_fail_next_root_hash: false,
         };
         // perf note: should we attempt to clone the cache
         let cache = BlockHashCache::new();
@@ -1677,19 +1847,47 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         }
         let tx = tx_begin_immediate(&mut self.db)?;
 
-        Ok(TrieStorageTransaction(TrieStorageConnection {
-            db: SqliteConnection::Tx(tx),
-            db_path: &self.db_path,
-            data: &mut self.data,
-            blobs: self.blobs.as_mut(),
-            cache: &mut self.cache,
-            hash_calculation_mode: self.hash_calculation_mode,
-            compress: self.compress,
-            unconfirmed_block_id: None,
+        // An extension opened by an earlier transaction has its lock committed already.  Take a
+        // savepoint so that `rollback_trie()` can undo just this transaction's SQL.
+        let extension = match self.data.uncommitted_writes.as_mut() {
+            Some((bhh, state)) => {
+                tx.execute_batch(&format!("SAVEPOINT {TX_BEGIN_SAVEPOINT}"))?;
+                state.trie_ram_mut().begin_undo();
+                Some(ExtensionCheckpoint {
+                    bhh: bhh.clone(),
+                    saved: None,
+                })
+            }
+            None => None,
+        };
+        let checkpoint = TxCheckpoint {
+            cur_block: self.data.cur_block.clone(),
+            cur_block_id: self.data.cur_block_id,
+            squash_info: self.data.squash_info.clone(),
+            extension,
+        };
 
-            #[cfg(test)]
-            test_genesis_block: &mut self.test_genesis_block,
-        }))
+        self.cache.begin_transaction();
+        if let Some(blobs) = self.blobs.as_mut() {
+            blobs.begin_transaction();
+        }
+
+        Ok(TrieStorageTransaction(
+            TrieStorageConnection {
+                db: SqliteConnection::Tx(tx),
+                db_path: &self.db_path,
+                data: &mut self.data,
+                blobs: self.blobs.as_mut(),
+                cache: &mut self.cache,
+                hash_calculation_mode: self.hash_calculation_mode,
+                compress: self.compress,
+                unconfirmed_block_id: None,
+
+                #[cfg(test)]
+                test_genesis_block: &mut self.test_genesis_block,
+            },
+            Some(checkpoint),
+        ))
     }
 
     pub fn sqlite_conn(&self) -> &Connection {
@@ -1821,6 +2019,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                 unconfirmed,
 
                 squash_info: None,
+
+                #[cfg(test)]
+                test_fail_next_root_hash: false,
             },
 
             // used in testing in order to short-circuit block-height lookups
@@ -1911,6 +2112,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                 unconfirmed: self.unconfirmed(),
 
                 squash_info: self.data.squash_info.clone(),
+
+                #[cfg(test)]
+                test_fail_next_root_hash: false,
             },
 
             // used in testing in order to short-circuit block-height lookups
@@ -1971,6 +2175,9 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
                 unconfirmed: self.unconfirmed(),
 
                 squash_info: self.data.squash_info.clone(),
+
+                #[cfg(test)]
+                test_fail_next_root_hash: false,
             },
 
             // used in testing in order to short-circuit block-height lookups
@@ -2005,6 +2212,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         if self.data.readonly {
             return Err(Error::ReadOnlyError);
         }
+        self.preserve_open_extension();
         if let Some((bhh, trie_ram)) = self.data.uncommitted_writes.take() {
             trace!("Buffering block flush started.");
 
@@ -2124,6 +2332,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
             return None;
         }
 
+        self.preserve_open_extension();
         let trie = self.data.uncommitted_writes.take();
         self.data.clear_block_id();
         trie.map(|(bhh, _)| bhh)
@@ -2133,6 +2342,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     pub fn drop_unconfirmed_trie(&mut self, bhh: &T) {
         self.clear_cached_ancestor_hashes_bytes();
         if !self.data.readonly && self.data.unconfirmed {
+            self.preserve_open_extension();
             trie_sql::drop_unconfirmed_trie(&self.db, bhh)
                 .expect("Corruption: Failed to drop unconfirmed trie");
             trie_sql::drop_lock(&self.db, bhh)
@@ -2146,6 +2356,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     /// Seal the inner uncommitted TrieRAM and return the MARF root hash.
     /// Only works if there's an uncommitted TrieRAM extension; panics if not.
     pub fn seal(&mut self) -> Result<TrieHash, Error> {
+        self.preserve_open_extension();
         if let Some((bhh, trie_ram)) = self.data.uncommitted_writes.take() {
             let sealed_trie_ram = trie_ram.seal(self)?;
             let root_hash = match &sealed_trie_ram {
@@ -2193,6 +2404,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
             return Err(Error::ExistsError);
         }
 
+        self.preserve_open_extension();
         self.switch_trie(bhh, UncommittedState::RW(trie_buf));
         Ok(())
     }
@@ -2241,6 +2453,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         }
 
         self.unconfirmed_block_id = unconfirmed_block_id;
+        self.preserve_open_extension();
         self.switch_trie(bhh, UncommittedState::RW(trie_buf));
         Ok(created)
     }
@@ -2256,6 +2469,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         // blow away db
         trie_sql::clear_tables(self.sqlite_tx())?;
 
+        self.preserve_open_extension();
         if let Some((_, ref mut trie_storage)) = self.data.uncommitted_writes {
             trie_storage.format()?
         };
@@ -2276,6 +2490,9 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
                     "BUG: Constructed TrieStorageTransaction with a bare sqlite connection ref."
                 );
             }
+            SqliteConnection::Finished => {
+                panic!("BUG: used a MARF storage transaction after it finished")
+            }
         }
     }
 
@@ -2287,41 +2504,195 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
                     "BUG: Constructed TrieStorageTransaction with a bare sqlite connection ref."
                 );
             }
+            SqliteConnection::Finished => {
+                panic!("BUG: used a MARF storage transaction after it finished")
+            }
         }
     }
 
-    pub fn commit_tx(self) {
-        match self.0.db {
-            SqliteConnection::Tx(tx) => {
-                tx.commit().expect("CORRUPTION: Failed to commit MARF");
-            }
+    /// Move the SQLite transaction out so it can be committed or rolled back, leaving
+    /// [`SqliteConnection::Finished`] in its place.
+    fn take_sqlite_tx(&mut self) -> Transaction<'a> {
+        match mem::replace(&mut self.0.db, SqliteConnection::Finished) {
+            SqliteConnection::Tx(tx) => tx,
             SqliteConnection::ConnRef(_) => {
                 unreachable!(
                     "BUG: Constructed TrieStorageTransaction with a bare sqlite connection ref."
                 );
             }
+            SqliteConnection::Finished => {
+                panic!("BUG: MARF storage transaction was already finished")
+            }
         }
+    }
+
+    /// If the transaction began with an extension open, save that extension as it was then
+    /// before the transaction takes or replaces it, so that abandoning the transaction can
+    /// reinstate it.  Does nothing if there was no such extension, if `uncommitted_writes` no
+    /// longer holds it, or if it was saved already.
+    ///
+    /// Call this before any code that takes or replaces `uncommitted_writes`.  Code that only
+    /// borrows it, or writes through its `write_nodetype()`/`write_node_hash()`, is covered by
+    /// the TrieRAM's undo journal.
+    fn preserve_open_extension(&mut self) {
+        let Some(extension) = self
+            .1
+            .as_mut()
+            .and_then(|checkpoint| checkpoint.extension.as_mut())
+        else {
+            return;
+        };
+        if extension.saved.is_some() {
+            return;
+        }
+        if let Some((bhh, state)) = self.0.data.uncommitted_writes.as_ref() {
+            if *bhh == extension.bhh {
+                extension.saved = Some(state.rewound_clone());
+            }
+        }
+    }
+
+    /// Keep the in-memory effects of the transaction: stop journaling and forget the checkpoint.
+    fn finish_checkpoint(&mut self) {
+        self.1 = None;
+        self.0.cache.commit_transaction();
+        if let Some(blobs) = self.0.blobs.as_deref_mut() {
+            blobs.commit_transaction();
+        }
+        if let Some((_, state)) = self.0.data.uncommitted_writes.as_mut() {
+            state.trie_ram_mut().end_undo();
+        }
+    }
+
+    /// Evict the block hashes and blob offsets cached while the transaction was open, since the
+    /// rows they describe were rolled back and SQLite may hand out their IDs again.
+    fn discard_cache_journals(&mut self) {
+        self.0.cache.discard_uncommitted();
+        if let Some(blobs) = self.0.blobs.as_deref_mut() {
+            blobs.discard_uncommitted_offsets();
+        }
+    }
+
+    /// If the transaction has not been committed or rolled back, restore the storage's in-memory
+    /// state to what it was when the transaction began.  Idempotent.  Does not touch SQLite:
+    /// dropping the SQLite transaction rolls it back.
+    pub(crate) fn recover_if_abandoned(&mut self) {
+        let Some(checkpoint) = self.1.take() else {
+            return;
+        };
+
+        let data = &mut *self.0.data;
+        match checkpoint.extension {
+            None => {
+                data.uncommitted_writes = None;
+            }
+            Some(ExtensionCheckpoint {
+                bhh,
+                saved: Some(state),
+            }) => {
+                data.uncommitted_writes = Some((bhh, state));
+            }
+            Some(ExtensionCheckpoint { bhh, saved: None }) => {
+                match data.uncommitted_writes.as_mut() {
+                    Some((open_bhh, state)) if *open_bhh == bhh => {
+                        state.trie_ram_mut().rewind();
+                    }
+                    _ => {
+                        error!("Abandoned MARF transaction lost the extension {bhh}");
+                        data.uncommitted_writes = None;
+                    }
+                }
+            }
+        }
+        data.set_block(checkpoint.cur_block, checkpoint.cur_block_id);
+        data.set_squash_info(checkpoint.squash_info);
+        data.trie_ancestor_hash_bytes_cache = None;
+        self.discard_cache_journals();
+    }
+
+    /// Commit the SQLite transaction and keep the in-memory state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the commit fails.
+    pub(crate) fn commit_in_place(&mut self) {
+        let tx = self.take_sqlite_tx();
+        tx.commit().expect("CORRUPTION: Failed to commit MARF");
+        self.finish_checkpoint();
+    }
+
+    pub fn commit_tx(mut self) {
+        self.commit_in_place();
+    }
+
+    /// Roll back the SQLite transaction and restore the in-memory state, as for an abandoned
+    /// transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the rollback fails.
+    pub(crate) fn rollback_in_place(&mut self) {
+        let tx = self.take_sqlite_tx();
+        tx.rollback().expect("CORRUPTION: Failed to roll back MARF");
+        self.recover_if_abandoned();
+    }
+
+    /// Discard the open extension and roll back this transaction's SQL changes, without issuing
+    /// cleanup queries when the extension began in this transaction: its lock is released by the
+    /// rollback.
+    ///
+    /// An extension opened by an earlier transaction has its lock committed already, so the
+    /// rollback only goes back to the savepoint taken when this transaction began and the lock is
+    /// released explicitly before committing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the SQL fails.
+    pub(crate) fn rollback_trie_in_place(&mut self) {
+        let checkpoint = self.1.take();
+        let preexisting_extension = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.extension.as_ref())
+            .map(|extension| extension.bhh.clone());
+
+        self.clear_extending_trie();
+        self.data.set_block(T::sentinel(), None);
+        if let Some(checkpoint) = checkpoint {
+            self.data.set_squash_info(checkpoint.squash_info);
+        }
+
+        let tx = self.take_sqlite_tx();
+        match preexisting_extension {
+            Some(bhh) => {
+                tx.execute_batch(&format!("ROLLBACK TO {TX_BEGIN_SAVEPOINT}"))
+                    .expect("CORRUPTION: Failed to roll back MARF");
+                trie_sql::drop_lock(&tx, &bhh)
+                    .expect("Corruption: Failed to drop the extended trie lock");
+                tx.commit().expect("CORRUPTION: Failed to commit MARF");
+            }
+            None => {
+                tx.rollback().expect("CORRUPTION: Failed to roll back MARF");
+            }
+        }
+        self.discard_cache_journals();
     }
 
     /// Discard transient trie state and roll back SQL changes without issuing cleanup queries.
     /// Locks acquired in this transaction are released by rollback.
     pub fn rollback_trie(mut self) {
-        self.clear_extending_trie();
-        self.data.set_block(T::sentinel(), None);
-        self.rollback();
+        self.rollback_trie_in_place();
     }
 
-    pub fn rollback(self) {
-        match self.0.db {
-            SqliteConnection::Tx(tx) => {
-                tx.rollback().expect("CORRUPTION: Failed to commit MARF");
-            }
-            SqliteConnection::ConnRef(_) => {
-                unreachable!(
-                    "BUG: Constructed TrieStorageTransaction with a bare sqlite connection ref."
-                );
-            }
-        }
+    pub fn rollback(mut self) {
+        self.rollback_in_place();
+    }
+}
+
+impl<T: MarfTrieId> Drop for TrieStorageTransaction<'_, T> {
+    /// Abandoning the transaction restores the storage's in-memory state; the SQLite transaction
+    /// rolls itself back when it is dropped.
+    fn drop(&mut self) {
+        self.recover_if_abandoned();
     }
 }
 
@@ -2613,19 +2984,12 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             }
         }
 
-        let uncommitted_writes = match self.data.uncommitted_writes.take() {
-            Some((bhh, trie_ram)) => {
-                let ptr = TriePtr::new(set_backptr(TrieNodeID::Node256 as u8), 0, 0);
-
-                let root_hash = trie_ram.read_node_hash(&ptr)?;
-
-                ret.insert(root_hash, bhh.clone());
-                Some((bhh, trie_ram))
-            }
-            _ => None,
-        };
-
-        self.data.uncommitted_writes = uncommitted_writes;
+        // Borrow the extension: an error here must leave it in place.
+        if let Some((bhh, trie_ram)) = self.data.uncommitted_writes.as_ref() {
+            let ptr = TriePtr::new(set_backptr(TrieNodeID::Node256 as u8), 0, 0);
+            let root_hash = trie_ram.read_node_hash(&ptr)?;
+            ret.insert(root_hash, bhh.clone());
+        }
 
         Ok(ret)
     }
@@ -3269,6 +3633,19 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         result
             + (trie_sql::count_blocks(&self.db)
                 .expect("Corruption: SQL Error on a non-fallible query.") as usize)
+    }
+
+    /// Arm a one-shot fault that makes the next root hash recalculation fail after the leaf has
+    /// been written, to exercise write paths that abort partway.
+    #[cfg(test)]
+    pub fn arm_root_hash_failure(&mut self) {
+        self.data.test_fail_next_root_hash = true;
+    }
+
+    /// Consume the fault armed by [`Self::arm_root_hash_failure`], if any.
+    #[cfg(test)]
+    pub(crate) fn take_root_hash_failure(&mut self) -> bool {
+        mem::take(&mut self.data.test_fail_next_root_hash)
     }
 
     #[cfg(test)]

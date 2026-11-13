@@ -21,6 +21,7 @@ use std::{assert_matches, fs};
 use tempfile::tempdir;
 
 use super::*;
+use crate::cache::BlockHashCache;
 use crate::*;
 
 fn ptrs_cmp(p1: &[TriePtr], p2: &[TriePtr]) -> bool {
@@ -627,4 +628,182 @@ fn test_dump_compressed_consume_cow_and_amendment_patches() {
             }
         }
     }
+}
+
+/// Open `store`'s block `bhh` as an empty RW extension (no root node yet) whose lock is
+/// committed, the way an earlier transaction would leave it.
+fn leave_empty_extension_open(store: &mut TrieFileStorage<BlockHeaderHash>, bhh: &BlockHeaderHash) {
+    let mut tx = store.transaction().unwrap();
+    tx.extend_to_block(bhh).unwrap();
+    tx.commit_tx();
+}
+
+/// Whether `bhh` holds an extension lock in `store`'s database.
+fn extension_lock_held(store: &TrieFileStorage<BlockHeaderHash>, bhh: &BlockHeaderHash) -> bool {
+    store
+        .sqlite_conn()
+        .query_row(
+            "SELECT 1 FROM block_extension_locks WHERE block_hash = ?",
+            [bhh],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok()
+}
+
+/// A failing `read_root_to_block_table()` on an empty extension opened by an earlier
+/// transaction must leave that extension, and its lock, in place for the next transaction.
+/// The extension has no root node yet, so the reader errors after it has borrowed the
+/// extension.
+#[test]
+fn test_read_root_to_block_table_error_keeps_extension() {
+    let a = BlockHeaderHash([0xaa; 32]);
+    let b = BlockHeaderHash([0xbb; 32]);
+
+    for rollback in [false, true] {
+        let mut store = TrieFileStorage::new_memory(opts::OPTS_IMM.clone()).unwrap();
+
+        // A is committed with a root node.
+        let mut tx = store.transaction().unwrap();
+        MARF::extend_trie(&mut tx, &a).unwrap();
+        tx.flush().unwrap();
+        tx.commit_tx();
+
+        leave_empty_extension_open(&mut store, &b);
+        assert!(extension_lock_held(&store, &b));
+
+        // The reader fails on B's empty TrieRAM; abandon the transaction without any cleanup.
+        let mut tx = store.transaction().unwrap();
+        assert_matches!(tx.read_root_to_block_table(), Err(Error::NotFoundError));
+        if rollback {
+            tx.rollback();
+        } else {
+            drop(tx);
+        }
+
+        let mut conn = store.connection();
+        assert_eq!(
+            conn.transient_data()
+                .uncommitted_writes
+                .as_ref()
+                .map(|(bhh, _)| bhh.clone()),
+            Some(b.clone()),
+            "extension B must survive the failed reader (rollback = {rollback})"
+        );
+        assert_eq!(conn.last_ptr().unwrap(), 0);
+        drop(conn);
+        assert!(extension_lock_held(&store, &b));
+
+        // B's root can still be written, and the table maps it to B.
+        let mut tx = store.transaction().unwrap();
+        let node = TrieNode256::new(&[]);
+        let hash = get_node_hash(&node, &[], &mut *tx);
+        tx.write_nodetype(0, &TrieNodeType::Node256(Box::new(node)), hash)
+            .unwrap();
+        assert_eq!(tx.read_root_to_block_table().unwrap().get(&hash), Some(&b));
+        tx.flush().unwrap();
+        tx.commit_tx();
+
+        let mut tx = store.transaction().unwrap();
+        assert_eq!(tx.read_root_to_block_table().unwrap().get(&hash), Some(&b));
+    }
+}
+
+/// `TrieRAM::rewind()` restores the nodes, hashes and write count that the TrieRAM had at
+/// `begin_undo()`, whatever mix of appends, overwrites and hash-only writes followed;
+/// `end_undo()` keeps the writes instead; `rewound_clone()` leaves the original alone.
+#[test]
+fn test_trie_ram_undo_journal() {
+    let bhh = BlockHeaderHash([1; 32]);
+    let leaf = |n: u8| TrieNodeType::Leaf(TrieLeaf::new(&[], &[n; 40]));
+    let snapshot = |ram: &TrieRAM<BlockHeaderHash>| format!("{:?}", ram.data());
+
+    let mut ram = TrieRAM::new(&bhh, 8, &BlockHeaderHash::sentinel());
+    for i in 0..3u8 {
+        ram.write_nodetype(u32::from(i), &leaf(i), TrieHash([i; 32]))
+            .unwrap();
+    }
+    let before = snapshot(&ram);
+    let before_writes = ram.size_hint();
+
+    // without a journal, nothing to rewind
+    ram.rewind();
+    assert_eq!(snapshot(&ram), before);
+
+    ram.begin_undo();
+    // The first value of an overwritten slot is the one that comes back.
+    ram.write_nodetype(1, &leaf(10), TrieHash([10; 32]))
+        .unwrap();
+    ram.write_nodetype(1, &leaf(11), TrieHash([11; 32]))
+        .unwrap();
+    ram.write_node_hash(0, TrieHash([12; 32])).unwrap();
+    ram.write_nodetype(3, &leaf(13), TrieHash([13; 32]))
+        .unwrap();
+    ram.write_nodetype(4, &leaf(14), TrieHash([14; 32]))
+        .unwrap();
+    ram.write_node_hash(4, TrieHash([15; 32])).unwrap();
+    let after = snapshot(&ram);
+    assert_ne!(after, before);
+    assert_ne!(ram.size_hint(), before_writes);
+
+    let rewound = ram.rewound_clone();
+    assert_eq!(snapshot(&rewound), before);
+    assert_eq!(rewound.size_hint(), before_writes);
+    assert_eq!(
+        snapshot(&ram),
+        after,
+        "rewound_clone() must not change the original"
+    );
+
+    ram.rewind();
+    assert_eq!(snapshot(&ram), before);
+    assert_eq!(ram.size_hint(), before_writes);
+    assert_eq!(ram.last_ptr().unwrap(), 3);
+
+    // rewinding again does nothing: the journal is gone
+    ram.write_nodetype(3, &leaf(20), TrieHash([20; 32]))
+        .unwrap();
+    ram.rewind();
+    assert_eq!(ram.last_ptr().unwrap(), 4);
+
+    // end_undo() keeps what was written
+    let mut ram = rewound;
+    ram.begin_undo();
+    ram.write_nodetype(3, &leaf(30), TrieHash([30; 32]))
+        .unwrap();
+    let kept = snapshot(&ram);
+    ram.end_undo();
+    ram.rewind();
+    assert_eq!(snapshot(&ram), kept);
+}
+
+/// Block hash cache entries inserted while a transaction is open are evicted, in both
+/// directions, if it is abandoned; earlier entries and committed ones stay.  An evicted row ID
+/// can then be cached for a different block.
+#[test]
+fn test_block_hash_cache_journal() {
+    let hash = |n: u8| BlockHeaderHash([n; 32]);
+    let mut cache = BlockHashCache::<BlockHeaderHash>::new();
+    cache.store_block_hash(1, hash(1));
+
+    cache.begin_transaction();
+    cache.store_block_hash(2, hash(2));
+    cache
+        .get_block_hash_caching::<Error, _>(3, |_| Ok(hash(3)))
+        .unwrap();
+    cache.discard_uncommitted();
+
+    assert_eq!(cache.ref_block_hash(1), Some(&hash(1)));
+    assert_eq!(cache.load_block_id(&hash(1)), Some(1));
+    for id in [2u32, 3] {
+        assert_eq!(cache.ref_block_hash(id), None);
+        assert_eq!(cache.load_block_id(&hash(id as u8)), None);
+    }
+
+    // the freed row ID can be cached for another block
+    cache.begin_transaction();
+    cache.store_block_hash(2, hash(4));
+    cache.commit_transaction();
+    cache.discard_uncommitted();
+    assert_eq!(cache.ref_block_hash(2), Some(&hash(4)));
+    assert_eq!(cache.load_block_id(&hash(4)), Some(2));
 }

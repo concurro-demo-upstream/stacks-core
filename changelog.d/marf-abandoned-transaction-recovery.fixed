@@ -1,0 +1,1 @@
+A MARF handle now returns to its exact pre-transaction state when a write transaction is dropped, rolled back or fails partway through a per-call insert, without leaking open tips, trie writes, block IDs or external-blob offsets into later reads and writes.

@@ -897,6 +897,13 @@ impl Trie {
         cursor: &TrieCursor<T>,
         update_skiplist: bool,
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        if storage.take_root_hash_failure() {
+            return Err(Error::CorruptionError(
+                "test-injected root hash failure".to_string(),
+            ));
+        }
+
         assert!(!cursor.node_ptrs.is_empty());
 
         let mut ptrs = cursor.node_ptrs.clone();

@@ -155,8 +155,41 @@ fn read_blob_header_chunk<T: MarfTrieId + Send + Sync>(
     Ok(headers)
 }
 
-/// Mapping between block IDs and trie offsets
-pub type TrieIdOffsets = HashMap<u32, u64>;
+/// Mapping between block IDs and trie offsets.
+///
+/// SQLite is the source of truth for these offsets.  While a storage transaction is open, the
+/// cache journals the IDs it learns, so that if the transaction is abandoned, the offsets of rows
+/// that were rolled back can be evicted before SQLite reuses their IDs.
+#[derive(Default)]
+pub struct TrieIdOffsets {
+    /// Trie blob offsets by block ID.
+    offsets: HashMap<u32, u64>,
+    /// IDs inserted since `begin_transaction()`, or `None` if no transaction is open.
+    uncommitted: Option<Vec<u32>>,
+}
+
+impl TrieIdOffsets {
+    fn new() -> TrieIdOffsets {
+        TrieIdOffsets::default()
+    }
+
+    fn get(&self, block_id: u32) -> Option<u64> {
+        self.offsets.get(&block_id).copied()
+    }
+
+    fn insert(&mut self, block_id: u32, offset: u64) {
+        self.offsets.insert(block_id, offset);
+        if let Some(uncommitted) = self.uncommitted.as_mut() {
+            uncommitted.push(block_id);
+        }
+    }
+
+    fn discard_uncommitted(&mut self) {
+        for block_id in self.uncommitted.take().unwrap_or_default() {
+            self.offsets.remove(&block_id);
+        }
+    }
+}
 
 /// Handle to a flat file containing Trie blobs
 pub struct TrieFileDisk {
@@ -250,7 +283,7 @@ impl TrieFile {
         let TrieFile::Disk(disk) = self else {
             return;
         };
-        let Some(&blob_offset) = disk.trie_offsets.get(&block_id) else {
+        let Some(blob_offset) = disk.trie_offsets.get(block_id) else {
             return;
         };
         let Some(abs) = blob_offset.checked_add(in_block_ptr) else {
@@ -489,33 +522,44 @@ impl NodeHashReader for TrieFileNodeHashReader<'_> {
 }
 
 impl TrieFile {
-    /// Cache a known trie blob offset.
-    pub(super) fn cache_trie_offset(&mut self, block_id: u32, offset: u64) {
-        let offsets_cache = match self {
+    fn trie_offsets_mut(&mut self) -> &mut TrieIdOffsets {
+        match self {
             TrieFile::RAM(ref mut ram) => &mut ram.trie_offsets,
             TrieFile::Disk(ref mut disk) => &mut disk.trie_offsets,
-        };
-        offsets_cache.insert(block_id, offset);
+        }
+    }
+
+    /// Start journaling the offsets cached from now on, for [`Self::discard_uncommitted_offsets`].
+    pub(super) fn begin_transaction(&mut self) {
+        self.trie_offsets_mut().uncommitted = Some(Vec::new());
+    }
+
+    /// Keep every offset cached since [`Self::begin_transaction`].
+    pub(super) fn commit_transaction(&mut self) {
+        self.trie_offsets_mut().uncommitted = None;
+    }
+
+    /// Evict every offset cached since [`Self::begin_transaction`], because the transaction that
+    /// wrote their rows was abandoned.
+    pub(super) fn discard_uncommitted_offsets(&mut self) {
+        self.trie_offsets_mut().discard_uncommitted();
+    }
+
+    /// Cache a known trie blob offset.
+    pub(super) fn cache_trie_offset(&mut self, block_id: u32, offset: u64) {
+        self.trie_offsets_mut().insert(block_id, offset);
     }
 
     /// Determine the file offset in the TrieFile where a serialized trie starts.
-    /// The offsets are stored in the given DB, and are cached indefinitely once loaded.
+    /// The offsets are stored in the given DB, and are cached once loaded, until the transaction
+    /// that first loaded them is abandoned.
     pub fn get_trie_offset(&mut self, db: &Connection, block_id: u32) -> Result<u64, Error> {
-        let offset_opt = match self {
-            TrieFile::RAM(ref ram) => ram.trie_offsets.get(&block_id),
-            TrieFile::Disk(ref disk) => disk.trie_offsets.get(&block_id),
-        };
-        match offset_opt {
-            Some(offset) => Ok(*offset),
-            None => {
-                let (offset, _length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
-                match self {
-                    TrieFile::RAM(ref mut ram) => ram.trie_offsets.insert(block_id, offset),
-                    TrieFile::Disk(ref mut disk) => disk.trie_offsets.insert(block_id, offset),
-                };
-                Ok(offset)
-            }
+        if let Some(offset) = self.trie_offsets_mut().get(block_id) {
+            return Ok(offset);
         }
+        let (offset, _length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
+        self.trie_offsets_mut().insert(block_id, offset);
+        Ok(offset)
     }
 
     /// Obtain a TrieHash for a node, given its block ID and pointer
