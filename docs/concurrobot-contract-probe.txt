@@ -1,0 +1,2 @@
+Disposable ConcurroBot contract probe.
+Replacement snapshot, unrelated to old head.
