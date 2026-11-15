@@ -15,7 +15,7 @@ def retry_delay(attempt: int, cap_seconds: int = 30) -> int:
     >>> retry_delay(8, 10)
     10
     """
-    return min(2 ** attempt, cap_seconds + 1)
+    return min(2 ** attempt, cap_seconds)
 
 
 if __name__ == "__main__":
